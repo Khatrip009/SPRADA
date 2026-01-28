@@ -1,0 +1,1182 @@
+Nice — I’ll wear all three hats (Postgres data-engineer + backend + frontend dev) and give you a concrete, production-ready blueprint you can hand to your client or implement directly. I’ll include:
+
+* Architecture & tech stack
+* Full Postgres schema (DDL) for product/category/blog/customer/analytics/notifications
+* API design (routes + behaviors + auth)
+* File upload strategy (product images)
+* Push notifications & service worker plan
+* Cookies, personalization & recommendation approach
+* Admin dashboard / frontend suggestions & components
+* Security, privacy, scaling and deployment notes
+* An implementation roadmap and priorities
+
+I won’t ask clarification — I’ll make reasonable, common-sense choices for an import/export business that wants to manage categories, products, blogs and visitor data themselves.
+
+# 1 — Architecture & tech stack (recommended)
+
+Backend
+
+* Node.js (TypeScript) with Fastify or Express — simple, fast, many libs.
+* PostgreSQL (primary data store).
+* Redis (cache, job queue).
+* Background worker: BullMQ (Node) or Bee-Queue for scheduled jobs & email/push sending.
+* File store: AWS S3 (or DigitalOcean Spaces / MinIO for self-hosted) for product images.
+* Web push: Web Push protocol (VAPID) for browser notifications.
+
+Frontend
+
+* React (Vite) + TypeScript.
+* Tailwind CSS + shadcn/ui or MUI for admin dashboard UI.
+* For admin: a single-page dashboard (CRUD forms, CSV import, image uploader).
+* For public site: React pages for product listings, product detail, blogs, contact forms.
+
+Other
+
+* Auth: JWT with refresh tokens; password hashing Argon2 / bcrypt (Argon2 preferred).
+* Analytics: self-hosted Matomo or Postgres events table for visitor events (privacy friendly).
+* Consent: cookie banner + granular consent storage.
+* Hosting: Backend on DigitalOcean / AWS ECS / Heroku / Fly; Postgres on managed provider (RDS/PGManaged) or Supabase.
+
+# 2 — Postgres schema (DDL)
+
+Below is a robust starting schema with keys, useful indexes and comments. It covers multi-tenant readiness (simple), RLS hooks, and reference tables.
+
+```sql
+-- core schema for import-export product site
+-- assumes Postgres >=13
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- roles (admin/editor/customer)
+CREATE TABLE roles (
+  id smallint PRIMARY KEY,
+  name text NOT NULL UNIQUE
+);
+
+INSERT INTO roles(id,name) VALUES (1,'admin'),(2,'editor'),(3,'viewer');
+
+-- users (admins/editors)
+CREATE TABLE users (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email citext UNIQUE NOT NULL,
+  password_hash text NOT NULL,
+  full_name text,
+  role_id smallint NOT NULL REFERENCES roles(id),
+  is_active boolean DEFAULT true,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON users (email);
+
+-- product categories (hierarchical)
+CREATE TABLE categories (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL,
+  description text,
+  parent_id uuid REFERENCES categories(id) ON DELETE SET NULL,
+  sort_order int DEFAULT 0,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON categories (slug);
+
+-- products
+CREATE TABLE products (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  sku text UNIQUE,                       -- optional SKU
+  title text NOT NULL,
+  slug text NOT NULL UNIQUE,
+  description text,
+  short_description text,
+  category_id uuid REFERENCES categories(id) ON DELETE SET NULL,
+  price numeric(12,2) NOT NULL DEFAULT 0,
+  currency text NOT NULL DEFAULT 'USD',
+  moq int DEFAULT 1,                      -- Minimum order quantity
+  available_qty int DEFAULT 0,
+  is_published boolean DEFAULT false,
+  metadata jsonb DEFAULT '{}'::jsonb,    -- extra fields (dimensions, weight etc.)
+  created_by uuid REFERENCES users(id),
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON products (slug);
+CREATE INDEX ON products (category_id);
+CREATE INDEX ON products USING gin (metadata jsonb_path_ops);
+
+-- product images
+CREATE TABLE product_images (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  product_id uuid NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  url text NOT NULL,
+  filename text,
+  is_primary boolean DEFAULT false,
+  width int,
+  height int,
+  filesize int,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON product_images (product_id, is_primary);
+
+-- blogs
+CREATE TABLE blogs (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title text NOT NULL,
+  slug text NOT NULL UNIQUE,
+  excerpt text,
+  content jsonb NOT NULL,  -- store structured content (e.g. editor blocks), or text
+  author_id uuid REFERENCES users(id),
+  is_published boolean DEFAULT false,
+  published_at timestamptz,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON blogs (slug);
+CREATE INDEX ON blogs (is_published, published_at);
+
+-- blog images (similar to product_images)
+CREATE TABLE blog_images (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  blog_id uuid REFERENCES blogs(id) ON DELETE CASCADE,
+  url text NOT NULL,
+  caption text,
+  created_at timestamptz DEFAULT now()
+);
+
+-- customers/contacts captured from web forms
+CREATE TABLE customers (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email citext,
+  name text,
+  phone text,
+  company text,
+  country text,
+  metadata jsonb DEFAULT '{}',
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON customers (email);
+
+-- visitors (anonymized visitor sessions)
+CREATE TABLE visitors (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  session_id text NOT NULL,
+  ip inet,
+  user_agent text,
+  first_seen timestamptz DEFAULT now(),
+  last_seen timestamptz DEFAULT now(),
+  metadata jsonb DEFAULT '{}'
+);
+
+CREATE INDEX ON visitors (session_id);
+
+-- analytics / event stream
+CREATE TABLE analytics_events (
+  id bigserial PRIMARY KEY,
+  visitor_id uuid REFERENCES visitors(id),
+  event_type text NOT NULL,  -- page_view | product_view | add_to_cart | newsletter_signup etc.
+  event_props jsonb DEFAULT '{}',
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX ON analytics_events (visitor_id);
+CREATE INDEX ON analytics_events (event_type);
+
+-- push subscription (for Web Push)
+CREATE TABLE push_subscriptions (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  visitor_id uuid REFERENCES visitors(id),
+  endpoint text NOT NULL,
+  public_key text NOT NULL,
+  auth text NOT NULL,
+  browser text,
+  created_at timestamptz DEFAULT now(),
+  last_ping timestamptz
+);
+
+CREATE INDEX ON push_subscriptions (visitor_id);
+
+-- scheduled notifications and logs
+CREATE TABLE notifications (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title text NOT NULL,
+  body text,
+  data jsonb DEFAULT '{}',
+  target_query jsonb,         -- e.g. {"event_type":"product_view","limit":100}
+  scheduled_at timestamptz,
+  sent boolean DEFAULT false,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE notification_logs (
+  id bigserial PRIMARY KEY,
+  notification_id uuid REFERENCES notifications(id),
+  subscription_id uuid REFERENCES push_subscriptions(id),
+  status text,
+  response jsonb,
+  attempted_at timestamptz DEFAULT now()
+);
+
+-- cookie consent
+CREATE TABLE cookie_consents (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  visitor_id uuid REFERENCES visitors(id),
+  consent jsonb,            -- {analytics: true, marketing: false, personalization: true}
+  created_at timestamptz DEFAULT now()
+);
+```
+
+Notes:
+
+* `metadata` JSONB fields allow extensibility (like HS code, origin port, lead time).
+* Add RLS and row-level policies if you want strict multi-tenant or per-role access.
+* Use prepared statements and parameterized queries.
+
+# 3 — API design (high level)
+
+Use RESTful or GraphQL; I recommend REST with a few GraphQL endpoints later for flexible queries.
+
+Auth
+
+* POST /api/auth/login -> returns { accessToken, refreshToken, expiresAt }
+* POST /api/auth/refresh -> refresh token flow
+* POST /api/auth/logout -> revoke refresh token
+
+Products & categories
+
+* GET /api/products?category=&q=&page=&size=&min_price=&max_price=&is_published=
+* GET /api/products/:slug
+* POST /api/products  (admin) -> body: JSON (slug, title, category_id, price, moq, metadata)
+* PUT /api/products/:id (admin)
+* DELETE /api/products/:id (admin)
+* POST /api/products/:id/images -> upload (returns S3 URL) — use presigned uploads (see below)
+
+Categories
+
+* GET /api/categories
+* POST /api/categories (admin)
+* PUT /api/categories/:id
+* DELETE /api/categories/:id
+
+Blogs
+
+* GET /api/blogs?page=&size=&q=
+* GET /api/blogs/:slug
+* POST /api/blogs (editor)
+* PUT /api/blogs/:id
+* PATCH /api/blogs/:id/publish
+
+Visitors / analytics
+
+* POST /api/visitors/identify -> returns session_id cookie and visitor id
+* POST /api/analytics -> { event_type, props } -> append to analytics_events
+
+Push
+
+* POST /api/push/subscribe -> { endpoint, keys, browser } -> store in push_subscriptions (requires visitor session)
+* POST /api/push/unsubscribe -> removes subscription
+* POST /api/notifications/schedule -> (admin) schedule a notification with target_query
+* GET /api/notifications/logs
+
+Admin dashboard
+
+* GET /api/admin/overview -> counts, recent orders/contacts, product stats
+* POST /api/admin/import/products -> CSV import endpoint (async job)
+* GET /api/admin/recommendations -> suggestions engine output
+
+File/Images
+
+* GET /api/uploads/presign -> { fileName, fileType } -> returns presigned PUT URL and final public URL. Backend validates fileType and user role.
+
+# 4 — File upload & images
+
+Use S3 presigned uploads (browser PUT) to avoid sending large images through backend.
+
+Flow:
+
+1. Admin client requests presigned URL: POST /api/uploads/presign { fileName, fileType, productId }.
+2. Backend validates user role, fileType, returns presigned URL and public URL.
+3. Client PUTs file directly to S3; then calls POST /api/products/:id/images with the public URL & metadata (width/height/filesize).
+4. Backend stores in `product_images`.
+
+Image handling:
+
+* On upload, run a serverless function or background job to generate thumbnails (e.g. 400x, 800x) and WebP conversions; save metadata to DB.
+* Use a CDN in front of S3.
+
+# 5 — Push notifications (auto-generated)
+
+Use the Web Push API:
+
+* Generate VAPID keys (server).
+* Client registers service worker and obtains subscription (PushManager.subscribe).
+* Client posts subscription to /api/push/subscribe.
+* Server stores subscription and can send push via web-push library.
+
+Auto-generation:
+
+* Create an analytics-driven rule engine (simple to start): scheduled job picks visitors who matched a query (e.g., viewed product X but didn’t contact in 7 days) and creates a `notifications` record. Worker sends pushes using saved subscriptions, logs results.
+* Allow manual send + preview in admin dashboard.
+
+Sample flow (client):
+
+```js
+// register service worker and subscribe
+const reg = await navigator.serviceWorker.register('/sw.js');
+const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: VAPID_PUBLIC_KEY });
+await fetch('/api/push/subscribe', { method:'POST', body: JSON.stringify(sub) });
+```
+
+# 6 — Cookies / personalization & consent
+
+Essential pieces:
+
+* Cookie consent banner at first visit (store consent in cookie + cookie_consents table).
+* Only set marketing/analytics cookies after explicit consent.
+* Use first-party cookies (session cookie + visitor id) for personalization.
+* Server stores visitor events in analytics_events table; use those events to generate content suggestions.
+
+Personalization approach (phased):
+
+1. Start with rule-based suggestions (e.g., show products from same category as last viewed).
+2. Track views: for each visitor, record product_view events.
+3. Recommendation jobs:
+
+   * Simple co-view matrix: products often viewed together.
+   * Use frequency & recency: boost recently viewed products.
+4. For advanced later: export anonymized event data and run collaborative filtering (ALS) offline.
+
+Privacy & compliance:
+
+* Allow users to opt out of tracking and delete visitor data (GDPR-like).
+* Provide clear privacy policy and consent UI for cookies.
+
+# 7 — Admin dashboard (features)
+
+Minimum viable admin dashboard:
+
+* Login (role based).
+* Product management: create/edit products, drag reorder images, bulk CSV import/export.
+* Category management (tree view).
+* Media manager: view/delete/upload images, auto-thumbnail preview.
+* Blog editor: WYSIWYG (Draft.js / TipTap) with image upload.
+* Customers & leads: list, search, export CSV.
+* Visitors & analytics: recent events, funnel, top viewed products.
+* Notifications: author, schedule, audience query builder, logs.
+* Settings: VAPID keys, S3 credentials, payment details, cookie text & GDPR settings.
+* Activity audit trail for admin actions.
+
+UI components to build:
+
+* Reusable Form components (TextInput, RichEditor, FileUploader).
+* Table with server-side pagination, sorting & filters.
+* Modal for product quick-edit.
+* Bulk action buttons.
+
+# 8 — Security & best practices
+
+* Hash passwords with Argon2; never store plain passwords.
+* Use HTTPS everywhere; HSTS.
+* Validate/escape all inputs; use parameterized queries (pg library).
+* Rate limit public endpoints.
+* Use Content Security Policy (CSP).
+* Implement CSRF protection for cookie-based auth; prefer token auth for API.
+* Validate image types & sizes server-side; virus scanning if necessary.
+* For push endpoints, check origin and require session cookie/visitor id.
+
+# 9 — Scaling & performance
+
+* Add indexes on common query columns (slug, category, event_type).
+* Use Redis caching for product lists and category trees.
+* Use a CDN for images.
+* Use background jobs for heavy tasks (image transforms, sending push/email).
+* Partition analytics_events by time if volume is large.
+
+# 10 — Implementation roadmap & priorities (12 week plan — adjustable)
+
+Phase 0 (week 0): Planning & infra
+
+* Confirm hosting (S3, Postgres provider).
+* Set up project skeleton repos (backend, frontend).
+* Generate VAPID keys, S3 bucket, CI/CD.
+
+Phase 1 (wk1–2): Core API & DB
+
+* Implement Postgres schema + migrations.
+* Basic auth + admin user CRUD.
+* Products & categories endpoints (CRUD).
+* Presigned upload endpoint.
+
+Phase 2 (wk3–4): Frontend MVP
+
+* Public site product list & product detail.
+* Admin product/category CRUD + image upload.
+* Cookie consent component & visitor identification.
+
+Phase 3 (wk5–6): Blogs & customers
+
+* Blog CRUD & public blog pages.
+* Contact form -> stores customers & sends admin email.
+* CSV import for products.
+
+Phase 4 (wk7–8): Analytics & push
+
+* Track page/product events and store in Postgres.
+* Implement service worker + push subscription.
+* Admin UI for scheduling & sending notifications.
+
+Phase 5 (wk9–12): Polish & security
+
+* Add thumbnails, CDN, thumbnails generation.
+* Add rate limiting, input sanitation, tests.
+* Performance tuning, backup strategy, documentation & handover to client.
+
+# 11 — Example: presigned upload endpoint (Node/Express, sketch)
+
+```ts
+// POST /api/uploads/presign
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+app.post('/api/uploads/presign', authMiddleware, async (req,res)=>{
+  const { fileName, fileType } = req.body;
+  // validate fileType & user role
+  const key = `products/${Date.now()}-${fileName}`;
+  const url = s3Client.getSignedUrl(new PutObjectCommand({
+    Bucket: BUCKET, Key: key, ContentType: fileType, ACL: 'private'
+  }), { expiresIn: 60 });
+  const publicUrl = `https://${BUCKET_CDN}/${key}`; // if using CDN/or make object public
+  res.json({ uploadUrl: url, publicUrl, key });
+});
+```
+
+# 12 — Example: subscribe to web push (client)
+
+```js
+async function subscribeToPush() {
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  const sub = await reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: base64ToUint8Array(VAPID_PUBLIC)
+  });
+  await fetch('/api/push/subscribe', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(sub) });
+}
+```
+
+# 13 — Recommendations / personalization quick recipe
+
+* Keep it simple to start: rule-based suggestions stored in `recommendations` or computed on the fly.
+* Track `product_view` and `category_view` events.
+* Run nightly job:
+
+  * Compute product co-view counts (product A co-viewed with B).
+  * Store top 10 co-view for each product.
+  * On product page show top co-views or category top sellers.
+* Use cookies + server match to show “Recently viewed” and personalized module.
+
+# 14 — Legal / privacy & consent (must-haves)
+
+* Add explicit Cookie Consent (analytics, personalization, marketing toggles).
+* Store consent in cookie + `cookie_consents` DB row.
+* Provide “Delete my data” feature for visitors/customers.
+* Display privacy policy & terms; link on footer.
+* If targeting EU customers, implement full GDPR flows; for India, follow local rules and be transparent.
+
+# 15 — Deliverables I can produce next (pick one to continue immediately)
+
+* 1. Full Postgres migration files (SQL) for the schema above.
+* 2. Ready-to-paste Express + TypeScript starter with auth, product endpoints and presigned upload.
+* 3. React admin scaffold (Vite + Tailwind) with product CRUD pages and image upload demo.
+* 4. Complete push service worker + server sending example.
+* 5. CSV import worker script for bulk product import.
+
+Tell me which deliverable you want now and I’ll produce it (fully working code/files) — I’ll generate it right away.
+Nice additions — these are all standard, high-value features for an e-commerce / content site. I’ll extend your existing `exotech_sprada` design with:
+
+* Audit logging (row-level change history) for important tables (products, blogs, users, customers, orders—if/when added).
+* Reviews & ratings (products & blogs) with moderation and aggregates.
+* Rich user profiles (admin/editor + public profiles for customers/registered visitors).
+* Reliable unique-visitor counting and analytics primitives (fast insertion, daily/monthly rollups, realtime counters).
+* Materialized views / summary tables for high-end analytics (funnel, daily active visitors, conversion rate).
+* SEO & Google Search recommendations (site structure, meta tags, structured data, sitemap, Server-Side Rendering / pre-rendering) and what to store in DB to support them.
+
+Below you’ll find: 1) the DB additions (DDL) ready to run as a migration, 2) triggers/functions for audit logs and rating aggregates, 3) queries/materialized views for analytics & counts, 4) implementation notes (Realtime counters, caching, moderation), and 5) SEO & Search Console checklist and how to store/serve meta fields.
+
+---
+
+# 1 — New DB objects: DDL (run as a migration)
+
+These statements intentionally use `IF NOT EXISTS` patterns to be safe applying on top of your current schema.
+
+```sql
+-- 1. Audit log table (generic)
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id bigserial PRIMARY KEY,
+  table_name text NOT NULL,
+  record_id text NOT NULL,        -- store PK as text for generality (uuid or int)
+  operation text NOT NULL,        -- INSERT | UPDATE | DELETE
+  changed_by uuid NULL,           -- users.id if known
+  changed_at timestamptz NOT NULL DEFAULT now(),
+  old_data jsonb,                 -- for UPDATE/DELETE
+  new_data jsonb,                 -- for INSERT/UPDATE
+  ctx jsonb DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS audit_logs_idx_table_time ON audit_logs (table_name, changed_at DESC);
+
+-- 2. Reviews & Ratings (for products and blogs)
+CREATE TABLE IF NOT EXISTS reviews (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  about_type text NOT NULL,       -- 'product' | 'blog' | other
+  about_id uuid NOT NULL,         -- references target table id
+  author_id uuid NULL,            -- users.id OR NULL for anonymous
+  author_name text,               -- cached name to show for anonymous users
+  author_email citext,            -- optional, for verification & moderation
+  rating smallint NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  title text,
+  body text,
+  is_published boolean DEFAULT false,
+  is_flagged boolean DEFAULT false,
+  moderation_notes text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS reviews_about_idx ON reviews (about_type, about_id);
+CREATE INDEX IF NOT EXISTS reviews_rating_idx ON reviews (rating DESC);
+
+-- 3. Aggregated review stats (for fast reads)
+CREATE TABLE IF NOT EXISTS review_aggregates (
+  about_type text NOT NULL,
+  about_id uuid NOT NULL,
+  avg_rating numeric(4,2) DEFAULT 0,
+  rating_count int DEFAULT 0,
+  rating_1 int DEFAULT 0,
+  rating_2 int DEFAULT 0,
+  rating_3 int DEFAULT 0,
+  rating_4 int DEFAULT 0,
+  rating_5 int DEFAULT 0,
+  last_reviewed timestamptz,
+  PRIMARY KEY (about_type, about_id)
+);
+
+-- 4. Profiles (public profile + extra fields)
+CREATE TABLE IF NOT EXISTS profiles (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id uuid UNIQUE NULL,       -- link to users if internal user, NULL for external
+  public_name text,
+  slug text UNIQUE,               -- for URLs: /profile/:slug
+  bio text,
+  avatar_url text,
+  location text,
+  company text,
+  website text,
+  social_links jsonb DEFAULT '{}', -- { twitter: "...", linkedin: "..."}
+  metadata jsonb DEFAULT '{}',
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS profiles_slug_idx ON profiles (slug);
+
+-- 5. Visitor first-time detection helper flags & first_seen already exists;
+-- But ensure visitors.session_id is unique (you have that).
+-- Add a boolean "is_new" to visitors? Better to compute during capture; we add a helper "first_seen" usage.
+
+-- 6. Visitor summary aggregates (daily)
+CREATE TABLE IF NOT EXISTS visitor_daily_summary (
+  day date NOT NULL,
+  visitors_count bigint DEFAULT 0,     -- unique visitor count (based on session_id)
+  page_views bigint DEFAULT 0,
+  new_visitors bigint DEFAULT 0,      -- those with first_seen = this day
+  PRIMARY KEY (day)
+);
+
+-- 7. Materialized views for heavy analytics queries
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_visitors AS
+SELECT created::date AS day,
+       count(DISTINCT session_id) AS unique_visitors,
+       count(*) FILTER (WHERE event_type = 'page_view') AS page_views
+FROM (
+  SELECT v.session_id, ev.event_type, ev.created_at AS created
+  FROM visitors v
+  LEFT JOIN analytics_events ev ON ev.visitor_id = v.id
+) x
+GROUP BY created::date
+ORDER BY day DESC;
+
+-- 8. Helper: ensure reviews trigger to keep updated_at and review_aggregates
+CREATE OR REPLACE FUNCTION reviews_update_aggregates() RETURNS trigger AS $$
+BEGIN
+  -- update timestamps
+  NEW.updated_at = now();
+
+  -- upsert aggregate for the target (product or blog)
+  PERFORM 1 FROM review_aggregates WHERE about_type = NEW.about_type AND about_id = NEW.about_id;
+  IF FOUND THEN
+    -- recalc aggregate (safe approach: recalc from reviews table)
+    UPDATE review_aggregates
+    SET
+      avg_rating = sub.avg_rating,
+      rating_count = sub.cnt,
+      rating_1 = sub.r1,
+      rating_2 = sub.r2,
+      rating_3 = sub.r3,
+      rating_4 = sub.r4,
+      rating_5 = sub.r5,
+      last_reviewed = sub.last_reviewed
+    FROM (
+      SELECT
+        AVG(rating)::numeric(4,2) AS avg_rating,
+        COUNT(*)::int AS cnt,
+        SUM((rating=1)::int)::int AS r1,
+        SUM((rating=2)::int)::int AS r2,
+        SUM((rating=3)::int)::int AS r3,
+        SUM((rating=4)::int)::int AS r4,
+        SUM((rating=5)::int)::int AS r5,
+        MAX(created_at) AS last_reviewed
+      FROM reviews
+      WHERE about_type = NEW.about_type AND about_id = NEW.about_id AND is_published = true
+    ) sub
+    WHERE review_aggregates.about_type = NEW.about_type AND review_aggregates.about_id = NEW.about_id;
+  ELSE
+    INSERT INTO review_aggregates (about_type, about_id, avg_rating, rating_count, rating_1, rating_2, rating_3, rating_4, rating_5, last_reviewed)
+    SELECT NEW.about_type, NEW.about_id, sub.avg_rating, sub.cnt, sub.r1, sub.r2, sub.r3, sub.r4, sub.r5, sub.last_reviewed
+    FROM (
+      SELECT
+        AVG(rating)::numeric(4,2) AS avg_rating,
+        COUNT(*)::int AS cnt,
+        SUM((rating=1)::int)::int AS r1,
+        SUM((rating=2)::int)::int AS r2,
+        SUM((rating=3)::int)::int AS r3,
+        SUM((rating=4)::int)::int AS r4,
+        SUM((rating=5)::int)::int AS r5,
+        MAX(created_at) AS last_reviewed
+      FROM reviews
+      WHERE about_type = NEW.about_type AND about_id = NEW.about_id AND is_published = true
+    ) sub;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger on INSERT/UPDATE/DELETE (for DELETE we need a separate trigger to pass OLD)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'reviews_upd_agg_trg') THEN
+    CREATE TRIGGER reviews_upd_agg_trg
+      AFTER INSERT OR UPDATE ON reviews
+      FOR EACH ROW
+      EXECUTE FUNCTION reviews_update_aggregates();
+  END IF;
+END$$;
+
+-- 9. Audit trigger function to capture row changes for monitored tables
+CREATE OR REPLACE FUNCTION audit_if_needed() RETURNS trigger AS $$
+DECLARE
+  user_id uuid := NULL;
+BEGIN
+  -- attempt to capture current_user mapping via session var (application can SET LOCAL "app.user_id" = 'uuid')
+  BEGIN
+    user_id := current_setting('app.user_id')::uuid;
+  EXCEPTION WHEN others THEN
+    user_id := NULL;
+  END;
+
+  IF TG_OP = 'DELETE' THEN
+    INSERT INTO audit_logs(table_name, record_id, operation, changed_by, changed_at, old_data, new_data, ctx)
+    VALUES (TG_TABLE_NAME, COALESCE(OLD.id::text, OLD.*::text), TG_OP, user_id, now(), row_to_json(OLD), NULL, jsonb_build_object('tg_when', now()));
+    RETURN OLD;
+  ELSIF TG_OP = 'UPDATE' THEN
+    INSERT INTO audit_logs(table_name, record_id, operation, changed_by, changed_at, old_data, new_data, ctx)
+    VALUES (TG_TABLE_NAME, COALESCE(NEW.id::text, NEW.*::text), TG_OP, user_id, now(), row_to_json(OLD), row_to_json(NEW), jsonb_build_object('tg_when', now()));
+    RETURN NEW;
+  ELSIF TG_OP = 'INSERT' THEN
+    INSERT INTO audit_logs(table_name, record_id, operation, changed_by, changed_at, old_data, new_data, ctx)
+    VALUES (TG_TABLE_NAME, COALESCE(NEW.id::text, NEW.*::text), TG_OP, user_id, now(), NULL, row_to_json(NEW), jsonb_build_object('tg_when', now()));
+    RETURN NEW;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 10. Attach the audit trigger to important tables:
+DO $$
+DECLARE
+  tbl text;
+BEGIN
+  FOR tbl IN SELECT unnest(ARRAY['products','blogs','users','customers','reviews','product_images','blog_images']) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger WHERE tgname = (tbl || '_audit_trg')
+    ) THEN
+      EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION audit_if_needed();', tbl || '_audit_trg', tbl);
+    END IF;
+  END LOOP;
+END$$;
+
+-- 11. Visitor capture helper (function to upsert visitor by session_id or IP)
+CREATE OR REPLACE FUNCTION upsert_visitor(session_id text, ip inet, ua text, meta jsonb DEFAULT '{}')
+RETURNS uuid AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  SELECT id INTO v_id FROM visitors WHERE session_id = session_id;
+  IF FOUND THEN
+    UPDATE visitors SET last_seen = now(), ip = COALESCE(ip, ip), user_agent = COALESCE(ua, user_agent), metadata = COALESCE(metadata, '{}'::jsonb) || meta WHERE id = v_id;
+    RETURN v_id;
+  ELSE
+    INSERT INTO visitors(session_id, ip, user_agent, metadata, first_seen, last_seen)
+      VALUES (session_id, ip, ua, meta, now(), now())
+      RETURNING id INTO v_id;
+    RETURN v_id;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 12. Materialized views / summary for quick dashboard (daily unique visitors)
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_unique_visitors_per_day AS
+SELECT date_trunc('day', v.first_seen)::date AS day,
+       COUNT(*) AS new_visitors
+FROM visitors v
+GROUP BY date_trunc('day', v.first_seen)
+ORDER BY day DESC;
+
+-- 13. Indexes for reviews and aggregates
+CREATE INDEX IF NOT EXISTS reviews_about_rating_idx ON reviews (about_type, about_id, rating);
+CREATE INDEX IF NOT EXISTS review_aggregates_idx ON review_aggregates (about_type, about_id);
+```
+
+---
+
+# 2 — How the pieces work together (behavior & notes)
+
+## Audit logs
+
+* The `audit_if_needed()` trigger saves `old_data` and `new_data` JSONB snapshots for INSERT/UPDATE/DELETE for monitored tables.
+* Your application should set `SET LOCAL app.user_id = 'uuid'` at the start of each DB transaction (or use `SET` per session) so the trigger can fill `changed_by`. If the app cannot, `changed_by` will be `NULL`.
+* Audit logs are append-only. Consider periodic archiving/compression or a separate schema for audit retention. Keep a retention policy (e.g., keep audit rows for 2–5 years) and delete older logs after export.
+
+## Reviews & Ratings
+
+* `reviews` table stores ratings for both products and blogs (`about_type` + `about_id` pattern). This makes the design flexible: you can later add `about_type = 'seller'` etc.
+* Only `is_published = true` reviews count into aggregates (helps moderation).
+* `reviews_update_aggregates()` trigger recalculates aggregates on INSERT/UPDATE of reviews. For heavy traffic, move recalculation to a background worker to avoid contention (but the trigger-based approach is simplest and consistent).
+
+## Profiles
+
+* `profiles` holds public-facing profile fields that can be displayed in site pages and author boxes on blogs.
+* `slug` is used for friendly profile URLs (`/profile/:slug`).
+
+## Visitor counting & analytics
+
+* Use the `upsert_visitor(session_id, ip, ua, meta)` function from your frontend analytics capture pipeline to create or update a visitor record on page load.
+* Distinguish unique visitors by `session_id` (set in first-party cookie, long TTL). When new visitor is created, increment realtime counter (see below).
+* For high-volume page views, write only to `analytics_events` for events and avoid heavy triggers there; use batched inserts if possible.
+
+---
+
+# 3 — Fast & accurate unique visitor counting (recommended approach)
+
+**Primary rule:** unique visitor = unique `session_id` stored in a first-party cookie. `session_id` should be a secure random UUID set on first page visit.
+
+### Flow
+
+1. On site load, if cookie `exotech_sid` is missing, generate a UUID client-side and set cookie (HTTP-only not required; use secure sameSite policy).
+2. Call backend `POST /api/visitors/identify` with `{ session_id, ip (auto), ua, meta }`.
+3. Backend runs `SELECT id FROM visitors WHERE session_id = $1` or calls `upsert_visitor()`; if newly inserted, consider it a new visitor.
+
+### Realtime counters (for dashboards)
+
+* Use Redis INCR to maintain daily counters:
+
+  * `INCR visitor:day:2025-11-20` when a new visitor is created.
+  * `INCR pageview:day:2025-11-20` on page_view events.
+* At midnight, persist Redis counters to `visitor_daily_summary` via background job, then reset Redis keys (or keep TTL).
+* Redis avoids heavy DB contention for burst traffic and gives immediate counters for admin dashboards.
+
+### SQL to get total visitors to date
+
+```sql
+SELECT count(*) FROM visitors;                       -- total unique sessions seen
+SELECT COUNT(DISTINCT session_id) FROM visitors;     -- same as above
+```
+
+### Daily unique visitors (from materialized view)
+
+```sql
+SELECT * FROM mv_unique_visitors_per_day ORDER BY day DESC LIMIT 30;
+```
+
+---
+
+# 4 — High-end analytics: suggestions, rollups & queries
+
+### Materialized / summary tables (recommended)
+
+* `visitor_daily_summary` — daily unique visitors, page_views, new_visitors.
+* `product_view_daily` — product-level daily views (product_id, day, views).
+* `funnels` — precompute funnel steps: visit → product_view → contact_form → order (if you add orders).
+
+### Example product-level rollup job (nightly)
+
+Pseudo logic:
+
+1. `INSERT INTO product_view_daily (product_id, day, views) SELECT ev.event_props->>'product_id' AS pid, created_at::date AS day, count(*) FROM analytics_events ev WHERE ev.event_type='product_view' GROUP BY pid, day;`
+
+### Example queries
+
+* Top 10 products this week:
+
+```sql
+SELECT p.id, p.title, SUM(d.views) AS week_views
+FROM product_view_daily d
+JOIN products p ON p.id::text = d.product_id -- if stored as text
+WHERE d.day >= current_date - INTERVAL '7 days'
+GROUP BY p.id,p.title
+ORDER BY week_views DESC LIMIT 10;
+```
+
+* Conversion rate from product views to contact form:
+
+```sql
+-- assume analytics_events stores event_type 'contact_form' with event_props->>'product_id'
+WITH pv AS (
+  SELECT ev.event_props->>'product_id' AS pid, COUNT(DISTINCT ev.visitor_id) AS viewers
+  FROM analytics_events ev WHERE ev.event_type='product_view' AND ev.created_at > now() - interval '30 days'
+  GROUP BY ev.event_props->>'product_id'
+),
+cf AS (
+  SELECT ev.event_props->>'product_id' AS pid, COUNT(DISTINCT ev.visitor_id) AS contacts
+  FROM analytics_events ev WHERE ev.event_type='contact_form' AND ev.created_at > now() - interval '30 days'
+  GROUP BY ev.event_props->>'product_id'
+)
+SELECT p.title, pv.viewers, COALESCE(cf.contacts,0) AS contacts,
+       (COALESCE(cf.contacts,0)::numeric / NULLIF(pv.viewers,0))::numeric(5,4) AS conversion_rate
+FROM pv LEFT JOIN cf USING (pid)
+JOIN products p ON p.id::text = pv.pid
+ORDER BY conversion_rate DESC NULLS LAST LIMIT 20;
+```
+
+---
+
+# 5 — Moderation & UX notes for reviews
+
+* New reviews default `is_published = false` until verified or auto-approved.
+* Provide admin moderation UI with filters: `is_flagged`, `rating`, `author_email`.
+* Support reporting/flagging from visitors (`is_flagged = true`) and an auto-review queue.
+* Rate-limit reviews per IP + require email verification for verified badge.
+* Keep `moderation_notes` in `reviews` and audit logs will capture moderator actions.
+
+---
+
+# 6 — Performance & scaling tips
+
+* Heavy write path: `analytics_events` — use bulk insert, queue-ing (Kafka / RabbitMQ / Redis Streams) if volume high.
+* Use Redis for counters and ephemeral metrics; persist to Postgres in scheduled jobs.
+* Partition `analytics_events` by date when > few million rows per month.
+* Index `event_props->>'product_id'` queries by creating expression index if querying often:
+  `CREATE INDEX ON analytics_events ((event_props->>'product_id'));`
+
+---
+
+# 7 — SEO & Google search (how DB supports it + implementation checklist)
+
+### What to store in DB (new fields or use existing metadata)
+
+* Per product & blog: `meta_title`, `meta_description`, `meta_keywords`, `canonical_url`, `og_title`, `og_description`, `og_image`.
+
+  * Add these as nullable fields in `products` and `blogs` (or store under `metadata` JSONB). I recommend explicit columns for `meta_title` and `meta_description` (they are used often).
+* Maintain `published_at` and `is_published` (already present).
+* Store `sitemap_lastmod` or use `updated_at` for sitemap `<lastmod>`.
+
+#### Quick DDL snippets to add meta columns
+
+```sql
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS meta_title text,
+  ADD COLUMN IF NOT EXISTS meta_description text,
+  ADD COLUMN IF NOT EXISTS canonical_url text,
+  ADD COLUMN IF NOT EXISTS og_image text;
+
+ALTER TABLE blogs
+  ADD COLUMN IF NOT EXISTS meta_title text,
+  ADD COLUMN IF NOT EXISTS meta_description text,
+  ADD COLUMN IF NOT EXISTS canonical_url text,
+  ADD COLUMN IF NOT EXISTS og_image text;
+```
+
+### Server-side rendering (critical)
+
+* Google indexes JavaScript sites but SSR or pre-rendering increases indexing speed & reliability. Options:
+
+  * Use Next.js (recommended) or Remix for SSR/SSG.
+  * If you stick with CRA/Vite SPA, use pre-rendering for static pages (products, blogs) and provide server-rendered meta tags (or use dynamic rendering / prerender service).
+* Ensure pages return fully populated `<title>` and `<meta name="description">` on first response.
+
+### Structured data (JSON-LD)
+
+* Add schema.org markup for products and articles (blogs). Example to include in page head:
+
+```html
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "Product",
+  "name": "Product title",
+  "image": ["https://.../image1.jpg"],
+  "description": "Short description",
+  "sku": "SKU",
+  "mpn": "mpn",
+  "brand": { "@type": "Brand", "name": "BrandName" },
+  "aggregateRating": {
+    "@type": "AggregateRating",
+    "ratingValue": "4.5",
+    "reviewCount": "12"
+  },
+  "offers": {
+    "@type": "Offer",
+    "url": "https://example.com/product-slug",
+    "priceCurrency": "USD",
+    "price": "199.00",
+    "availability": "https://schema.org/InStock"
+  }
+}
+</script>
+```
+
+* Generate JSON-LD using `review_aggregates` and product rows.
+
+### Sitemap & Robots
+
+* Auto-generate `sitemap.xml` from DB (products, categories, blogs, profiles) with `<lastmod>` from `updated_at/published_at`. Expose at `/sitemap.xml`.
+* Add `robots.txt` allowing crawl and pointing to sitemap: `Sitemap: https://example.com/sitemap.xml`.
+* Register sitemap in Google Search Console.
+
+### Speed & Mobile
+
+* Page speed is critical: optimize images (WebP, responsive srcset), enable caching & CDN, enable Brotli/Gzip.
+* Use Lighthouse audits and target mobile-first performance.
+
+### Canonicalization & Duplicate content
+
+* Ensure canonical URLs are set (product variants should canonicalize).
+* Use `rel="canonical"` and avoid indexation of low-value pages (e.g., paginated category pages if necessary).
+
+### Links & Rich snippets
+
+* Use `og:` Open Graph tags + Twitter Card tags; they make social shares look good and indirectly help traffic.
+* Implement breadcrumb structured data for category pages.
+
+### Monitoring SEO
+
+* Connect site to Google Search Console & Bing Webmaster Tools.
+* Upload sitemap and monitor crawl errors, coverage, and indexation.
+* Monitor search performance (queries, impressions, CTR).
+
+---
+
+# 8 — Sample SQL queries / endpoints to support SEO features
+
+* Sitemap rows for products (example):
+
+```sql
+SELECT slug AS url, updated_at AS lastmod FROM products WHERE is_published = true;
+```
+
+* JSON-LD generation for product (server API returns product + review aggregates):
+
+```sql
+SELECT p.*, r.avg_rating, r.rating_count
+FROM products p
+LEFT JOIN review_aggregates r ON r.about_type='product' AND r.about_id = p.id
+WHERE p.slug = 'my-product-slug' AND p.is_published = true;
+```
+
+Server templates use these fields to build meta tags and JSON-LD.
+
+---
+
+# 9 — Security & anti-abuse for analytics/reviews
+
+* Throttle events per session/IP to avoid spam.
+* Use honeypot fields & rate limits for reviews.
+* For anonymous reviews, consider email double opt-in before publishing or mark them with `is_verified` flag after email confirmation.
+
+---
+
+# 10 — Deliverables I can produce next (pick any)
+
+I can generate any of the following immediately:
+
+1. **Complete SQL migration file** that adds all DDL above (audit, reviews, profiles, aggregates, triggers, indexes, meta fields for SEO).
+2. **Node/TypeScript example** server functions: `POST /api/visitors/identify`, `POST /api/reviews`, `GET /sitemap.xml` and JSON-LD rendering for product pages.
+3. **Redis + Postgres pattern** script (Node) for realtime counters + nightly persistence to `visitor_daily_summary`.
+4. **SSR / SEO checklist & Next.js starter** with examples of server-rendered product + blog pages and sample JSON-LD generation.
+5. **Moderation UI mockups** (React components) for review moderation + audit logs viewer + analytics dashboard widgets.
+
+Tell me the number you want and I’ll produce that right away — or say “give me the SQL migration” and I’ll paste a single ready-to-run migration file with everything in section 1 merged and ordered.
+Short answer: **Yes — you’re basically ready to start building the backend.**
+You already have a solid, hardened Postgres schema (`exotech_sprada` on port `5435`) with audit, reviews, analytics primitives, triggers and indexes. Below I’ll list what is already ready, what still needs to be in place before you run code in production, a minimal “first sprint” implementation plan, an environment checklist (secrets/services), and an immediate offer: I can scaffold the full backend (TypeScript + Fastify/Express) with auth, migrations, presigned uploads, visitor identify + analytics ingest, reviews endpoints, and admin endpoints — ready to run against your database. Say “scaffold backend” and I’ll generate the ready-to-paste repo files.
+
+---
+
+# ✅ What you already have (good to go)
+
+* Finalized Postgres schema with tables: `products`, `categories`, `blogs`, `product_images`, `blog_images`, `reviews`, `review_aggregates`, `visitors`, `analytics_events`, `push_subscriptions`, `notifications`, `notification_logs`, `audit_logs`, `cookie_consents`, `profiles`, plus indexes/triggers.
+* Full-text search `search_vector`, trigram indexes for fuzzy search.
+* Visitor upsert function and aggregate/materialized-view templates for analytics.
+* Audit triggers for tracked tables.
+* Review aggregates triggers.
+* A DB user role example (`exotech_app`) created as a template.
+
+---
+
+# ⚠️ What we should add / confirm before coding the backend
+
+1. **DB connection & credentials**
+
+   * Confirm the app DB user, host, port (you said port `5435`), password, and that remote connections are allowed (from app host).
+   * Ensure TLS if exposing DB outside local network.
+
+2. **Secrets & external services** (needed to run features)
+
+   * S3-compatible storage (AWS S3 / DigitalOcean Spaces / MinIO): bucket name, access key, secret, region, optional CDN URL.
+   * VAPID keys for web-push (public/private).
+   * Redis instance for caching / realtime counters / job queue.
+   * SMTP (or transactional email provider) for contact forms, review verification, admin alerts.
+   * JWT secret (access + refresh), Argon2 parameters (or bcrypt config).
+   * App domain and SSL certs (for push subscription, cookies, and SEO).
+
+3. **Deployment environment**
+
+   * Where to host backend (DigitalOcean App / Droplet, AWS ECS/EC2, Fly, Render, Vercel (if serverless), Heroku).
+   * CI/CD pipeline (GitHub Actions recommended) and secrets manager (Github Secrets / Vault).
+
+4. **Migration tooling**
+
+   * Choose a migration tool (pg-migrate, Flyway, Liquibase, Knex migrations). I’ll produce migration files compatible with your choice if you tell me; otherwise I’ll produce raw SQL you can run with psql.
+   * Ensure that migrations run as a dedicated `exotech_migrations` DB user (optional).
+
+5. **CORS / cookie policy / consent**
+
+   * Decide domain(s) for cookies and API origins and cookie SameSite policy.
+   * Confirm if you want cookie session auth or token auth (I recommend stateless JWT for API + refresh tokens with HttpOnly refresh cookie).
+
+6. **Monitoring & logging**
+
+   * Decide log aggregator (Papertrail / LogDNA / Elastic / CloudWatch).
+   * Metrics: Prometheus + Grafana or use provider built-ins.
+
+---
+
+# 🛠 Minimal backend feature set to implement first (MVP / Sprint 1)
+
+These endpoints/tasks get you live, allow the client to manage content, and start collecting visitor data:
+
+Backend core (Auth + data)
+
+* Auth: `POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/auth/logout` (admin/editor roles)
+* Users CRUD for admins
+* Products: `GET /api/products`, `GET /api/products/:slug`, `POST /api/products` (admin), `PUT /api/products/:id`, `DELETE /api/products/:id`
+* Categories CRUD
+* Presigned upload: `POST /api/uploads/presign` (validate role, return presigned PUT URL + final public URL)
+* Product images: `POST /api/products/:id/images` (store URL + metadata after upload)
+* Blogs: CRUD + publish endpoint
+* Reviews: `POST /api/reviews`, moderator endpoints to publish/flag
+* Visitors & analytics:
+
+  * `POST /api/visitors/identify` — call `upsert_visitor()` and return `visitor_id` cookie
+  * `POST /api/analytics` — record events to `analytics_events` (batch support)
+* Push subscribe: `POST /api/push/subscribe` and `POST /api/push/unsubscribe`
+* Admin notifications: `POST /api/notifications/schedule`
+
+Ops & infra tasks
+
+* Background worker (BullMQ) to send scheduled notifications and create thumbnails.
+* Redis counters + nightly job to persist to `visitor_daily_summary`.
+* Basic admin dashboard endpoints: `GET /api/admin/overview` (counts, top products, recent reviews, recent visitors).
+
+Non-functional (security/perf)
+
+* Rate limiting (per-IP and per-session for events and reviews)
+* Input validation & sanitization
+* Unit/integration tests for auth and critical endpoints
+* Logging + error reporting
+
+---
+
+# 📁 Recommended tech stack (my recommended choices)
+
+* Backend framework: **Node.js + TypeScript** with **Fastify** (fast + typed) or **Express** (wider familiarity). I’ll scaffold in Fastify unless you prefer Express.
+* DB client: `pg` + `slonik` or `pg` + `drizzle`/`knex`/TypeORM. I recommend `pg` + `slonik` or `drizzle` for safer SQL and migrations with raw SQL.
+* Migrations: `node-pg-migrate` or `Flyway`. I’ll create plain SQL migration ready for node-pg-migrate.
+* Background jobs: `BullMQ` with Redis.
+* Storage: AWS S3 or DigitalOcean Spaces (presigned uploads).
+* Push: `web-push` npm package (VAPID).
+* Auth: JWT access tokens (short-lived) + refresh tokens stored in DB or secure cookie.
+* Image transformations: use a serverless function or worker to generate WebP & thumbnails (Sharp library).
+
+---
+
+# 🔐 Example `.env` (what your backend will need)
+
+```
+NODE_ENV=production
+PORT=4000
+
+DATABASE_URL=postgres://exotech_app:supersecret@db-host:5435/exotech_sprada
+DB_POOL_MIN=2
+DB_POOL_MAX=20
+
+JWT_SECRET=change_this_long_random_secret
+JWT_ACCESS_EXPIRES=15m
+JWT_REFRESH_EXPIRES=30d
+
+S3_BUCKET=exotech-media
+S3_REGION=ap-south-1
+S3_ACCESS_KEY=AKIA...
+S3_SECRET_KEY=...
+S3_CDN_URL=https://cdn.example.com
+
+REDIS_URL=redis://:password@redis-host:6379/0
+
+VAPID_PUBLIC=...
+VAPID_PRIVATE=...
+
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=...
+SMTP_PASS=...
+
+APP_DOMAIN=https://www.example.com
+COOKIE_SECURE=true
+```
+
+---
+
+# ✅ Quick commands to test DB connectivity (run locally)
+
+```bash
+# test with psql (substitute host and user)
+psql "host=localhost port=5435 dbname=exotech_sprada user=postgres"
+
+# simple query
+psql "host=localhost port=5435 dbname=exotech_sprada user=postgres" -c "SELECT count(*) FROM products;"
+```
+
+---
+
+# ✅ Next immediate actions I can do for you (choose one)
+
+I’ll produce fully ready-to-paste code/files for any of the below **right now**:
+
+1. **Scaffold backend** (TypeScript + Fastify) with auth, migrations, product/category/blog CRUD, presigned upload endpoint, visitor identify + analytics ingest, reviews endpoints, and example background worker — ready to run against `exotech_sprada`.
+2. **Plain SQL migration**: consolidated single migration file that includes all current DB changes + the audit/review/profile additions + SEO meta columns (so you can apply it with your migration tool).
+3. **Redis counters + persistence script** (Node) for realtime visitor/pageview counting and nightly persistence to `visitor_daily_summary`.
+4. **Push scheduler worker** (Node + BullMQ) that picks `notifications` rows and sends pushes to `push_subscriptions` and writes `notification_logs`.
+5. **A minimal Postman / HTTP collection** for the MVP endpoints (auth, products, presign, visitors, analytics, reviews).
+
+Tell me the number (1–5) or say “scaffold backend” to get the full ready-to-paste backend scaffold (I’ll generate project files, route handlers, DB access layer, and README with run instructions).
