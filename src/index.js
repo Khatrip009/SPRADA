@@ -134,8 +134,10 @@ function mount(route, pathName) {
 
 mount('auth', '/api/auth');
 mount('products', '/api/products');
+mount('product-images', '/api/product-images');
 mount('categories', '/api/categories');
 mount('blogs', '/api/blogs');
+mount('blog-images', '/api/blog-images');
 mount('users', '/api/users');
 mount('reviews', '/api/reviews');
 mount('events', '/api/events');
