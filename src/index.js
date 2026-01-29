@@ -109,10 +109,16 @@ app.get('/health', async (req, res) => {
 let jwtAuthMiddleware = require('./middleware/jwt').jwtAuthMiddleware;
 
 app.use('/api', (req, res, next) => {
+  // Public routes
   if (req.path.startsWith('/auth')) return next();
+  if (req.path.startsWith('/visitors')) return next();      // ✅ analytics
+  if (req.path.startsWith('/metrics')) return next();       // ✅ analytics
   if (req.path === '/leads' && req.method === 'POST') return next();
+
+  // Everything else requires JWT
   return jwtAuthMiddleware(req, res, next);
 });
+
 
 /* ---------------- ROUTES ---------------- */
 const routesBase = path.join(__dirname, 'routes');
