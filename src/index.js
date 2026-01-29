@@ -110,10 +110,10 @@ function mount(route, url) {
 
 mount('auth', '/api/auth');
 mount('products', '/api/products');
-mount('productimages', '/api/product-images');
+mount('productImages', '/api/product-images');
 mount('categories', '/api/categories');
 mount('blogs', '/api/blogs');
-mount('blogimages', '/api/blog-images');
+mount('blogImages', '/api/blog-images');
 mount('users', '/api/users');
 mount('reviews', '/api/reviews');
 mount('events', '/api/events');
