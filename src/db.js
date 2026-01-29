@@ -1,6 +1,9 @@
 const { Pool } = require('pg');
-const dotenv = require('dotenv');
-dotenv.config();
+require('dotenv').config();
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is not set');
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -12,10 +15,13 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000
 });
 
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle pg client', err);
+pool.on('connect', () => {
+  console.log('🟢 Connected to Supabase PostgreSQL');
 });
 
-console.log("🔵 Using DATABASE_URL:", process.env.DATABASE_URL);
+pool.on('error', (err) => {
+  console.error('🔴 Unexpected PG error', err);
+  process.exit(1);
+});
 
 module.exports = { pool };
