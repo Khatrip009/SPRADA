@@ -15,7 +15,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
-const fileUpload = require('express-fileupload');
+
 
 // ✅ DB POOL
 const { pool } = require('./db');
@@ -37,7 +37,7 @@ app.use(express.urlencoded({ extended: true, limit: '16mb' }));
 /* ---------------- FILE UPLOAD (REQUIRED FOR SUPABASE) ---------------- */
 app.use(
   fileUpload({
-    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
     abortOnLimit: true,
     createParentPath: false
   })
