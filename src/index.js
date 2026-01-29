@@ -435,58 +435,7 @@ app.get('/health', async (req, res) => {
   res.json({ ok: true, uptime, timestamp, env: ENV, user: null, db: dbProbe });
 });
 
-/* ----------------------
-   Attach DB helper (optional)
-   ---------------------- */
-(function attachDbIfPresent() {
-  const tryPaths = [ path.join(__dirname, 'db'), path.join(__dirname, '..', 'db') ];
-  let db = null;
-  for (const p of tryPaths) {
-    try {
-      const mod = require(p);
-      if (mod) {
-        db = mod;
-        console.log(`Loaded DB helper from ${p}`);
-        break;
-      }
-    } catch (e) {
-      if (e.code !== 'MODULE_NOT_FOUND') {
-        console.warn(`Error requiring DB helper ${p}:`, e && e.message);
-      }
-    }
-  }
-  if (!db) return;
-  const pool = db.pool || db.client || db;
-  if (pool && typeof pool.query === 'function') {
-    app.locals.db = pool;
-    app.use((req, res, next) => { req.db = app.locals.db; next(); });
 
-    if (typeof pool.connect === 'function') {
-      app.use((req, res, next) => {
-        req.txRun = async (fn, ctx = {}) => {
-          const client = await pool.connect();
-          try {
-            await client.query('BEGIN');
-            if (ctx.settings) {
-              for (const s of ctx.settings) {
-                await client.query(s.sql, s.params || []);
-              }
-            }
-            const result = await fn(client);
-            await client.query('COMMIT');
-            return result;
-          } catch (err) {
-            try { await client.query('ROLLBACK'); } catch {}
-            throw err;
-          } finally {
-            client.release();
-          }
-        };
-        next();
-      });
-    }
-  }
-})();
 
 /* ----------------------
    JWT AUTH MIDDLEWARE (unchanged)
