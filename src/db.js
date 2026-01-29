@@ -1,4 +1,11 @@
+<<<<<<< Updated upstream
 'use strict';
+=======
+
+const { Pool } = require('pg');
+const dotenv = require('dotenv');
+dotenv.config();
+>>>>>>> Stashed changes
 
 const { Pool } = require('pg');
 
@@ -30,4 +37,9 @@ pool.on('error', (err) => {
   process.exit(1);
 });
 
+<<<<<<< Updated upstream
+=======
+console.log("🔵 Using DATABASE_URL:", process.env.DATABASE_URL);
+
+>>>>>>> Stashed changes
 module.exports = { pool };
