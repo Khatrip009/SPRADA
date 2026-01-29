@@ -134,6 +134,9 @@ mount('users', '/api/users');
 mount('reviews', '/api/reviews');
 mount('events', '/api/events');
 mount('leads', '/api/leads');
+mount('visitors', '/api/visitors');
+mount('metrics', '/api/metrics');
+
 
 /* ---------------- 404 ---------------- */
 app.use('/api', (req, res) => {
