@@ -58,7 +58,16 @@ function formatPublicRow(row) {
   const effective_trade_type = product_trade_type || category_trade_type || 'both';
 
   // Normalize og_image and primary_image to canonical full URLs
-  const ogImage = buildImageUrl(row.og_image || (row.metadata && row.metadata.og_image) || null);
+  function normalizeSupabaseUrl(path) {
+  if (!path) return null;
+  if (path.startsWith('http')) return path;
+  return `https://kwthxsumqqssiywdcevx.supabase.co/storage/v1/object/public/sprada_storage/${path}`;
+}
+
+const ogImage = normalizeSupabaseUrl(
+  row.og_image || (row.metadata && row.metadata.og_image) || null
+);
+
   const primaryImage = row.primary_image
   ? row.primary_image.startsWith('http')
     ? row.primary_image
