@@ -59,7 +59,11 @@ function formatPublicRow(row) {
 
   // Normalize og_image and primary_image to canonical full URLs
   const ogImage = buildImageUrl(row.og_image || (row.metadata && row.metadata.og_image) || null);
-  const primaryImage = buildImageUrl(row.primary_image || null);
+  const primaryImage = row.primary_image
+  ? row.primary_image.startsWith('http')
+    ? row.primary_image
+    : `https://kwthxsumqqssiywdcevx.supabase.co/storage/v1/object/public/sprada_storage/products/${row.primary_image}`
+  : null;
 
   return {
     id: row.id,
