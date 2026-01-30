@@ -1,161 +1,245 @@
-// src/routes/blogImages.js
-// Blog images router — follows project style (jwt based auth helpers)
+'use strict';
 
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
-const multer = require('multer');
-const path = require('path');
-const fsPromises = require('fs/promises');
-const fsSync = require('fs');
-
-const { buildImageUrl } = require('../lib/buildUrl');
+const { validate: isUuid } = require('uuid');
+const { createClient } = require('@supabase/supabase-js');
 
 const router = express.Router();
 
-const UPLOAD_ROOT = process.env.LOCAL_UPLOAD_DIR || path.join(process.cwd(), 'public', 'uploads');
-const BLOG_DIR = path.join(UPLOAD_ROOT, 'blogs');
+/* =====================================================
+   SUPABASE SERVER CLIENT
+===================================================== */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-(async () => {
-  try { await fsPromises.mkdir(BLOG_DIR, { recursive: true }); } catch (e) { /* ignore */ }
-})();
+const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'sprada_storage';
 
-const storage = multer.diskStorage({
-  destination(req, file, cb) { cb(null, BLOG_DIR); },
-  filename(req, file, cb) {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${Date.now()}-${uuidv4()}${ext}`);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 6 * 1024 * 1024 },
-  fileFilter(req, file, cb) {
-    if (!file.mimetype || !file.mimetype.startsWith('image/')) return cb(new Error('invalid_file_type'));
-    cb(null, true);
-  }
-});
+/* =====================================================
+   HELPERS
+===================================================== */
+function sendOK(res, data = {}) {
+  return res.json({ ok: true, ...data });
+}
+
+function sendError(res, code = 400, message = 'error') {
+  return res.status(code).json({ ok: false, error: message });
+}
 
 function requireEditorOrAdmin(req, res) {
-  if (!req.user) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const role = Number(req.user.role);
-  if (role === 1 || role === 2) return null;
-  return res.status(403).json({ ok: false, error: "forbidden" });
+  if (!req.user) {
+    sendError(res, 401, 'unauthorized');
+    return false;
+  }
+  const role = Number(req.user.role_id || req.user.role);
+  if (role === 1 || role === 2) return true;
+  sendError(res, 403, 'forbidden');
+  return false;
 }
+
 function requireAdmin(req, res) {
-  if (!req.user) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const role = Number(req.user.role);
-  if (role === 1) return null;
-  return res.status(403).json({ ok: false, error: "forbidden" });
+  if (!req.user) {
+    sendError(res, 401, 'unauthorized');
+    return false;
+  }
+  const role = Number(req.user.role_id || req.user.role);
+  if (role === 1) return true;
+  sendError(res, 403, 'forbidden');
+  return false;
 }
 
-function sendOK(res, data = {}) { return res.json({ ok: true, ...data }); }
-function sendError(res, code = 400, message = 'error') { return res.status(code).json({ ok: false, error: message }); }
+function publicUrl(path) {
+  if (!path) return null;
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
+  return data?.publicUrl || null;
+}
 
-/* GET images by blog_id (requires blog_id query param) */
+/* =====================================================
+   GET BLOG IMAGES
+   GET /api/blog-images?blog_id=UUID
+===================================================== */
 router.get('/', async (req, res) => {
-  const db = req.db;
-  const blogId = req.query.blog_id;
-  if (!blogId) return sendError(res, 400, 'blog_id_required');
+  const db = req.app.locals.db;
+  const { blog_id } = req.query;
+
+  if (!isUuid(blog_id)) {
+    return sendError(res, 400, 'invalid_blog_id');
+  }
 
   try {
-    const { rows } = await db.query(`SELECT id, blog_id, url, caption, created_at FROM blog_images WHERE blog_id = $1 ORDER BY created_at DESC`, [blogId]);
+    const { rows } = await db.query(
+      `
+      SELECT id, blog_id, url, caption, created_at
+      FROM blog_images
+      WHERE blog_id = $1
+      ORDER BY created_at DESC
+      `,
+      [blog_id]
+    );
 
-    // normalize URLs to canonical full URL
-    const images = rows.map(r => ({
-      ...r,
-      url: buildImageUrl(r.url)
+    const images = rows.map(img => ({
+      id: img.id,
+      blog_id: img.blog_id,
+      caption: img.caption,
+      created_at: img.created_at,
+      url: publicUrl(img.url)
     }));
 
     return sendOK(res, { images });
   } catch (err) {
-    console.error('[blog-images.GET] error:', err);
+    console.error('[blog-images.GET]', err);
     return sendError(res, 500, 'server_error');
   }
 });
 
-/* Upload (editor/admin) - multipart */
-router.post('/', (req, res) => {
-  if (requireEditorOrAdmin(req, res)) return;
-  return upload.single('file')(req, res, async (err) => {
-    if (err) {
-      console.error('[blog-images.POST] multer error:', err);
-      return sendError(res, 400, err.message || 'upload_error');
-    }
-    const db = req.db;
-    try {
-      const { blog_id, caption = null } = req.body || {};
-      if (!blog_id) return sendError(res, 400, 'blog_id_required');
-      if (!req.file) return sendError(res, 400, 'file_required');
+/* =====================================================
+   UPLOAD BLOG IMAGE (EDITOR / ADMIN)
+   POST /api/blog-images
+   multipart/form-data
+===================================================== */
+router.post('/', async (req, res) => {
+  if (!requireEditorOrAdmin(req, res)) return;
 
-      // build canonical public URL using buildImageUrl helper
-      const relPath = `/uploads/blogs/${encodeURIComponent(req.file.filename)}`;
-      const publicUrl = buildImageUrl(relPath);
+  const db = req.app.locals.db;
+  const { blog_id, caption = null } = req.body;
 
-      const id = uuidv4();
-      const insertQ = `INSERT INTO blog_images (id, blog_id, url, caption, created_at) VALUES ($1,$2,$3,$4, now()) RETURNING *`;
-      const { rows } = await db.query(insertQ, [id, blog_id, publicUrl, caption]);
-      // ensure returned url is canonical (buildImageUrl is idempotent for full URLs)
-      const image = { ...rows[0], url: buildImageUrl(rows[0].url) };
-      return res.status(201).json({ ok: true, image });
-    } catch (err2) {
-      console.error('[blog-images.POST] error:', err2);
-      return sendError(res, 500, 'server_error');
-    }
-  });
-});
+  if (!isUuid(blog_id)) {
+    return sendError(res, 400, 'invalid_blog_id');
+  }
 
-/* JSON mode (editor/admin) - add image by URL */
-router.post('/by-url', (req, res) => {
-  if (requireEditorOrAdmin(req, res)) return;
-  (async () => {
-    const db = req.db;
-    const { blog_id, url, caption = null } = req.body || {};
-    if (!blog_id) return sendError(res, 400, 'blog_id_required');
-    if (!url) return sendError(res, 400, 'url_required');
+  if (!req.files || !req.files.file) {
+    return sendError(res, 400, 'file_required');
+  }
 
-    try {
-      const canonicalUrl = buildImageUrl(url);
-      const id = uuidv4();
-      const insertQ = `INSERT INTO blog_images (id, blog_id, url, caption, created_at) VALUES ($1,$2,$3,$4, now()) RETURNING *`;
-      const { rows } = await db.query(insertQ, [id, blog_id, canonicalUrl, caption]);
-      const image = { ...rows[0], url: buildImageUrl(rows[0].url) };
-      return res.status(201).json({ ok: true, image });
-    } catch (err) {
-      console.error('[blog-images.POST-json] error:', err);
-      return sendError(res, 500, 'server_error');
-    }
-  })();
-});
+  const file = req.files.file;
+  const ext = file.name.split('.').pop();
+  const storagePath = `blogs/${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}.${ext}`;
 
-/* DELETE image (admin only) */
-router.delete('/:id', (req, res) => {
-  if (requireAdmin(req, res)) return;
-  (async () => {
-    const db = req.db;
-    const id = req.params.id;
-    try {
-      const { rows } = await db.query('SELECT url FROM blog_images WHERE id = $1 LIMIT 1', [id]);
-      if (!rows[0]) return sendError(res, 404, 'not_found');
-      const url = rows[0].url;
-      await db.query('DELETE FROM blog_images WHERE id = $1', [id]);
+  try {
+    /* Upload to Supabase Storage */
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET)
+      .upload(storagePath, file.data, {
+        contentType: file.mimetype,
+        upsert: false
+      });
 
-      // attempt to unlink local file if present
-      try {
-        if (typeof url === 'string' && url.includes('/uploads/blogs/')) {
-          const filename = decodeURIComponent(url.split('/').pop());
-          const filePath = path.join(BLOG_DIR, filename);
-          if (fsSync.existsSync(filePath)) await fsPromises.unlink(filePath);
-        }
-      } catch (e) {
-        console.warn('[blog-images.DELETE] unlink warning:', e?.message || e);
+    if (uploadError) throw uploadError;
+
+    /* Insert into DB */
+    const { rows } = await db.query(
+      `
+      INSERT INTO blog_images (blog_id, url, caption, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING id, blog_id, url, caption, created_at
+      `,
+      [blog_id, storagePath, caption]
+    );
+
+    const image = rows[0];
+
+    return res.status(201).json({
+      ok: true,
+      image: {
+        id: image.id,
+        blog_id: image.blog_id,
+        caption: image.caption,
+        created_at: image.created_at,
+        url: publicUrl(image.url)
       }
+    });
+  } catch (err) {
+    console.error('[blog-images.POST]', err);
+    return sendError(res, 500, 'upload_failed');
+  }
+});
 
-      return sendOK(res, {});
-    } catch (err) {
-      console.error('[blog-images.DELETE] error:', err);
-      return sendError(res, 500, 'server_error');
+/* =====================================================
+   ADD BLOG IMAGE BY URL (JSON)
+   POST /api/blog-images/by-url
+===================================================== */
+router.post('/by-url', async (req, res) => {
+  if (!requireEditorOrAdmin(req, res)) return;
+
+  const db = req.app.locals.db;
+  const { blog_id, url, caption = null } = req.body;
+
+  if (!isUuid(blog_id)) {
+    return sendError(res, 400, 'invalid_blog_id');
+  }
+
+  if (!url || typeof url !== 'string') {
+    return sendError(res, 400, 'url_required');
+  }
+
+  try {
+    const { rows } = await db.query(
+      `
+      INSERT INTO blog_images (blog_id, url, caption, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING id, blog_id, url, caption, created_at
+      `,
+      [blog_id, url, caption]
+    );
+
+    const image = rows[0];
+
+    return res.status(201).json({
+      ok: true,
+      image: {
+        id: image.id,
+        blog_id: image.blog_id,
+        caption: image.caption,
+        created_at: image.created_at,
+        url: publicUrl(image.url)
+      }
+    });
+  } catch (err) {
+    console.error('[blog-images.POST-by-url]', err);
+    return sendError(res, 500, 'server_error');
+  }
+});
+
+/* =====================================================
+   DELETE BLOG IMAGE (ADMIN)
+   DELETE /api/blog-images/:id
+===================================================== */
+router.delete('/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = req.app.locals.db;
+  const { id } = req.params;
+
+  if (!isUuid(id)) {
+    return sendError(res, 400, 'invalid_id');
+  }
+
+  try {
+    const { rows } = await db.query(
+      'SELECT url FROM blog_images WHERE id=$1',
+      [id]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'not_found');
     }
-  })();
+
+    const path = rows[0].url;
+
+    /* Remove from storage */
+    await supabase.storage.from(BUCKET).remove([path]);
+
+    /* Remove from DB */
+    await db.query('DELETE FROM blog_images WHERE id=$1', [id]);
+
+    return sendOK(res);
+  } catch (err) {
+    console.error('[blog-images.DELETE]', err);
+    return sendError(res, 500, 'delete_failed');
+  }
 });
 
 module.exports = router;
