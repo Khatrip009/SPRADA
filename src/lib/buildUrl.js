@@ -1,16 +1,17 @@
-
-const UPLOADS_BASE = process.env.API_UPLOADS_HOST || 'https://apisprada.exotech.co.in';
+const SUPABASE_PUBLIC_BASE =
+  process.env.SUPABASE_PUBLIC_STORAGE_URL ||
+  'https://kwthxsumqqssiywdcexv.supabase.co/storage/v1/object/public';
 
 function buildImageUrl(imagePath) {
   if (!imagePath) return null;
 
-  // Already a full URL?
+  // Already absolute
   if (/^https?:\/\//i.test(imagePath)) return imagePath;
 
-  // Ensure leading slash
-  if (!imagePath.startsWith('/')) imagePath = '/' + imagePath;
+  // normalize
+  if (imagePath.startsWith('/')) imagePath = imagePath.slice(1);
 
-  return UPLOADS_BASE + imagePath;
+  return `${SUPABASE_PUBLIC_BASE}/${imagePath}`;
 }
 
 module.exports = { buildImageUrl };
