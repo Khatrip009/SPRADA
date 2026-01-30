@@ -22,9 +22,31 @@ function badRequest(res, msg) {
   return res.status(400).json({ ok: false, error: msg });
 }
 
-function publicUrl(path) {
+function normalizeStoragePath(path) {
   if (!path) return null;
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
+
+  // If FULL URL was mistakenly stored, extract relative path
+  if (path.startsWith("http")) {
+    const marker = `/storage/v1/object/public/${BUCKET}/`;
+    const idx = path.indexOf(marker);
+    if (idx !== -1) {
+      return path.slice(idx + marker.length);
+    }
+    return null; // invalid legacy URL
+  }
+
+  // Ensure no leading slash
+  return path.replace(/^\/+/, "");
+}
+
+function publicUrl(path) {
+  const cleanPath = normalizeStoragePath(path);
+  if (!cleanPath) return null;
+
+  const { data } = supabase.storage
+    .from(BUCKET)
+    .getPublicUrl(cleanPath);
+
   return data?.publicUrl || null;
 }
 
