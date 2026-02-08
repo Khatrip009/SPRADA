@@ -1,6 +1,6 @@
 const SUPABASE_PUBLIC_BASE =
   process.env.SUPABASE_PUBLIC_STORAGE_URL ||
-  'https://kwthxsumqqssiywdcexv.supabase.co/storage/v1/object/public';
+  'https://kwthxsumqqssiywdcevx.supabase.co/storage/v1/object/public';
 
 function buildImageUrl(imagePath) {
   if (!imagePath) return null;
