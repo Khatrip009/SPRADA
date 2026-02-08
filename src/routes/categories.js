@@ -1,13 +1,13 @@
 // -----------------------------
 // src/routes/categories.js
-// (updated) — adds pagination, trade_type filtering and search for website use
+// FINAL — pagination, trade_type, search + image support (Supabase storage)
 // -----------------------------
 
-const express2 = require('express');
-const router2 = express2.Router();
-const { v4: uuidv42 } = require('uuid');
+const express = require('express');
+const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 
-const ALLOWED_TRADE_TYPES2 = new Set(['import', 'export', 'both']);
+const ALLOWED_TRADE_TYPES = new Set(['import', 'export', 'both']);
 
 /* -----------------------------------------------------------------------
    Helpers
@@ -22,15 +22,20 @@ function slugify(text = "") {
     .replace(/^-|-$/g, "");
 }
 
-function normalizeTradeTypeInput2(v) {
+function normalizeTradeType(v) {
   if (v == null) return null;
-  try {
-    const s = String(v).trim().toLowerCase();
-    if (!s) return null;
-    return ALLOWED_TRADE_TYPES2.has(s) ? s : null;
-  } catch {
-    return null;
+  const s = String(v).trim().toLowerCase();
+  return ALLOWED_TRADE_TYPES.has(s) ? s : null;
+}
+
+function normalizeImagePath(v) {
+  if (!v) return null;
+  const s = String(v).trim();
+  // enforce supabase categories folder
+  if (!s.startsWith('/categories/')) {
+    throw new Error('invalid_image_path');
   }
+  return s;
 }
 
 function requireAuth2(req, res) {
@@ -49,44 +54,39 @@ function requireEditorOrAdmin2(req, res) {
    GET /api/categories
    Supports: ?include_counts=true, ?page, ?limit, ?q, ?trade_type
 ------------------------------------------------------------------------ */
-router2.get('/', async (req, res) => {
+router.get('/', async (req, res) => {
   const db = req.db;
-  const includeCounts = String(req.query.include_counts || "").toLowerCase() === "true";
-
   try {
     if (!db) throw new Error("database pool unavailable");
 
-    // Pagination params (useable by website)
+    const includeCounts = String(req.query.include_counts) === 'true';
     const page = Math.max(1, Number(req.query.page || 1));
-    let limit = Math.max(1, Number(req.query.limit || 100));
-    if (limit > 1000) limit = 1000; // safe upper bound
+    let limit = Math.min(1000, Math.max(1, Number(req.query.limit || 100)));
     const offset = (page - 1) * limit;
 
-    const q = (req.query.q || null);
-    const trade_type = (req.query.trade_type ?? null);
-
-    const filters = [];
     const params = [];
+    const filters = [];
 
-    if (q) {
-      params.push(`%${q}%`);
+    if (req.query.q) {
+      params.push(`%${req.query.q}%`);
       filters.push(`(c.name ILIKE $${params.length} OR c.slug ILIKE $${params.length} OR c.description ILIKE $${params.length})`);
     }
 
-    if (trade_type) {
-      const nt = normalizeTradeTypeInput2(trade_type);
-      if (nt === null) return res.status(400).json({ ok: false, error: 'invalid_trade_type' });
-      params.push(nt);
-      filters.push(`(c.trade_type = $${params.length})`);
+    if (req.query.trade_type) {
+      const tt = normalizeTradeType(req.query.trade_type);
+      if (!tt) return res.status(400).json({ ok: false, error: 'invalid_trade_type' });
+      params.push(tt);
+      filters.push(`c.trade_type = $${params.length}`);
     }
 
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
     if (includeCounts) {
-      // If includeCounts is true, return all matching categories with product_count and paginated
       const qtext = `
-        SELECT c.id, c.slug, c.name, c.description, c.parent_id, c.trade_type,
-               COALESCE(pc.product_count, 0) AS product_count
+        SELECT
+          c.id, c.slug, c.name, c.description, c.parent_id,
+          c.trade_type, c.image,
+          COALESCE(pc.product_count, 0) AS product_count
         FROM categories c
         LEFT JOIN (
           SELECT category_id, COUNT(*)::int AS product_count
@@ -98,70 +98,75 @@ router2.get('/', async (req, res) => {
         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
       `;
       params.push(limit, offset);
+
       const { rows } = await db.query(qtext, params);
 
-      // total count for pagination
-      let total = 0;
-      try {
-        const countQ = `SELECT COUNT(*)::int AS total FROM categories c ${where}`;
-        const countParams = params.slice(0, params.length - 2);
-        const cr = await db.query(countQ, countParams);
-        total = cr.rows[0]?.total ?? 0;
-      } catch (countErr) {
-        console.warn('[categories.GET] count failed', countErr && countErr.message ? countErr.message : countErr);
-      }
+      const countRes = await db.query(
+        `SELECT COUNT(*)::int AS total FROM categories c ${where}`,
+        params.slice(0, params.length - 2)
+      );
 
-      const total_pages = total != null ? Math.ceil(total / limit) : null;
-
-      return res.json({ ok: true, categories: rows, page, limit, total, total_pages });
+      const total = countRes.rows[0]?.total || 0;
+      return res.json({
+        ok: true,
+        categories: rows,
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit)
+      });
     }
 
-    // default (no counts): return paginated categories
-    const qtextNoCounts = `SELECT id, slug, name, description, parent_id, trade_type FROM categories ${where} ORDER BY sort_order NULLS LAST, name LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    const qtext = `
+      SELECT id, slug, name, description, parent_id, trade_type, image
+      FROM categories c
+      ${where}
+      ORDER BY sort_order NULLS LAST, name
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
     params.push(limit, offset);
-    const { rows } = await db.query(qtextNoCounts, params);
 
-    // total
-    let total = 0;
-    try {
-      const countQ = `SELECT COUNT(*)::int AS total FROM categories c ${where}`;
-      const countParams = params.slice(0, params.length - 2);
-      const cr = await db.query(countQ, countParams);
-      total = cr.rows[0]?.total ?? 0;
-    } catch (countErr) {
-      console.warn('[categories.GET] count failed', countErr && countErr.message ? countErr.message : countErr);
-    }
+    const { rows } = await db.query(qtext, params);
 
-    const total_pages = total != null ? Math.ceil(total / limit) : null;
+    const countRes = await db.query(
+      `SELECT COUNT(*)::int AS total FROM categories c ${where}`,
+      params.slice(0, params.length - 2)
+    );
 
-    return res.json({ ok: true, categories: rows, page, limit, total, total_pages });
+    const total = countRes.rows[0]?.total || 0;
+
+    return res.json({
+      ok: true,
+      categories: rows,
+      page,
+      limit,
+      total,
+      total_pages: Math.ceil(total / limit)
+    });
   } catch (err) {
-    console.error('[categories.GET /] error:', err);
-    return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
+    console.error('[categories.GET]', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
+
 
 /* -----------------------------------------------------------------------
    GET /api/categories/:id
 ------------------------------------------------------------------------ */
-router2.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res) => {
   const db = req.db;
-  const id = req.params.id;
-
   try {
-    if (!db) throw new Error("database pool unavailable");
-
     const { rows } = await db.query(
-      `SELECT id, slug, name, description, parent_id, trade_type FROM categories WHERE id=$1 LIMIT 1`,
-      [id]
+      `SELECT id, slug, name, description, parent_id, trade_type, image
+       FROM categories WHERE id=$1 LIMIT 1`,
+      [req.params.id]
     );
 
-    if (!rows[0]) return res.status(404).json({ ok: false, error: "not_found" });
-
+    if (!rows[0]) return res.status(404).json({ ok: false, error: 'not_found' });
     return res.json({ ok: true, category: rows[0] });
   } catch (err) {
-    console.error("[categories.GET /:id] error:", err);
-    return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
+    console.error('[categories.GET/:id]', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
@@ -170,79 +175,95 @@ router2.get('/:id', async (req, res) => {
    Body: { name, slug?, description?, parent_id?, sort_order?, trade_type? }
    Roles: admin/editor only
 ------------------------------------------------------------------------ */
-router2.post('/', async (req, res) => {
-  if (requireEditorOrAdmin2(req, res)) return;
+/* -----------------------------------------------------------------------
+   POST /api/categories
+   Body:
+   {
+     name,
+     slug?,
+     description?,
+     parent_id?,
+     sort_order?,
+     trade_type?,
+     image?   // "/categories/industrial-machinery.jpg"
+   }
+------------------------------------------------------------------------ */
+router.post('/', async (req, res) => {
+  if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
   const body = req.body || {};
 
   try {
-    if (!db) throw new Error("database pool unavailable");
-
     if (!body.name || !String(body.name).trim()) {
-      return res.status(400).json({ ok: false, error: "name_required" });
+      return res.status(400).json({ ok: false, error: 'name_required' });
     }
 
-    const trade_type_input = body.trade_type ?? 'both';
-    const normalized = normalizeTradeTypeInput2(trade_type_input);
-    if (normalized === null) {
-      return res.status(400).json({ ok: false, error: "invalid_trade_type" });
-    }
-    const trade_type = normalized;
-
-    const newId = uuidv42();
+    const id = uuidv4();
     const slug = slugify(body.slug || body.name);
-    const description = body.description || null;
-    const parent_id = body.parent_id || null;
-    const sort_order = Number.isInteger(body.sort_order) ? body.sort_order : 0;
 
-    // Use transaction if available
-    if (req.txRun) {
-      const created = await req.txRun(async client => {
-        const dup = await client.query(`SELECT id FROM categories WHERE slug=$1 LIMIT 1`, [slug]);
-        if (dup.rows[0]) throw Object.assign(new Error("slug_conflict"), { status: 409 });
-
-        await client.query(
-          `INSERT INTO categories (id, slug, name, description, parent_id, sort_order, trade_type, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7, now(), now())`,
-          [newId, slug, body.name, description, parent_id, sort_order, trade_type]
-        );
-
-        const r = await client.query(
-          `SELECT id, slug, name, description, parent_id, trade_type FROM categories WHERE id=$1`,
-          [newId]
-        );
-
-        return r.rows[0];
-      });
-
-      return res.status(201).json({ ok: true, category: created });
+    const trade_type = normalizeTradeType(body.trade_type || 'both');
+    if (!trade_type) {
+      return res.status(400).json({ ok: false, error: 'invalid_trade_type' });
     }
 
-    // fallback (no txRun)
-    const dup = await db.query(`SELECT id FROM categories WHERE slug=$1 LIMIT 1`, [slug]);
-    if (dup.rows[0]) return res.status(409).json({ ok: false, error: "slug_conflict" });
+    const image = normalizeImagePath(body.image);
+
+    // slug uniqueness check
+    const dup = await db.query(
+      `SELECT id FROM categories WHERE slug=$1 LIMIT 1`,
+      [slug]
+    );
+    if (dup.rows[0]) {
+      return res.status(409).json({ ok: false, error: 'slug_conflict' });
+    }
 
     await db.query(
-      `INSERT INTO categories (id, slug, name, description, parent_id, sort_order, trade_type, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7, now(), now())`,
-      [newId, slug, body.name, description, parent_id, sort_order, trade_type]
+      `INSERT INTO categories (
+        id,
+        slug,
+        name,
+        description,
+        parent_id,
+        sort_order,
+        trade_type,
+        image,
+        created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+      [
+        id,
+        slug,
+        body.name.trim(),
+        body.description || null,
+        body.parent_id || null,
+        Number.isInteger(body.sort_order) ? body.sort_order : 0,
+        trade_type,
+        image
+      ]
     );
 
-    const r = await db.query(
-      `SELECT id, slug, name, description, parent_id, trade_type FROM categories WHERE id=$1`,
-      [newId]
+    const { rows } = await db.query(
+      `SELECT
+         id, slug, name, description, parent_id,
+         sort_order, trade_type, image,
+         created_at, updated_at
+       FROM categories
+       WHERE id=$1`,
+      [id]
     );
 
-    return res.status(201).json({ ok: true, category: r.rows[0] });
+    return res.status(201).json({ ok: true, category: rows[0] });
   } catch (err) {
-    console.error("[categories.POST] error:", err);
+    console.error('[categories.POST]', err);
 
-    if (err.status === 409) {
-      return res.status(409).json({ ok: false, error: "slug_conflict" });
+    if (err.message === 'invalid_image_path') {
+      return res.status(400).json({
+        ok: false,
+        error: 'image_must_be_in_categories_folder'
+      });
     }
 
-    return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
@@ -250,94 +271,99 @@ router2.post('/', async (req, res) => {
    PUT /api/categories/:id
    Roles: admin/editor only
 ------------------------------------------------------------------------ */
-router2.put('/:id', async (req, res) => {
-  if (requireEditorOrAdmin2(req, res)) return;
+/* -----------------------------------------------------------------------
+   PUT /api/categories/:id
+   Body:
+   {
+     name,
+     slug?,
+     description?,
+     parent_id?,
+     sort_order?,
+     trade_type?,
+     image?
+   }
+------------------------------------------------------------------------ */
+router.put('/:id', async (req, res) => {
+  if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
-  const id = req.params.id;
   const body = req.body || {};
+  const id = req.params.id;
 
   try {
-    if (!db) throw new Error("database pool unavailable");
-
     if (!body.name || !String(body.name).trim()) {
-      return res.status(400).json({ ok: false, error: "name_required" });
-    }
-
-    const trade_type_input = body.trade_type ?? null;
-    let trade_type = null;
-    if (trade_type_input != null) {
-      const normalized = normalizeTradeTypeInput2(trade_type_input);
-      if (normalized === null) {
-        return res.status(400).json({ ok: false, error: "invalid_trade_type" });
-      }
-      trade_type = normalized;
+      return res.status(400).json({ ok: false, error: 'name_required' });
     }
 
     const slug = slugify(body.slug || body.name);
-    const description = body.description || null;
-    const parent_id = body.parent_id || null;
-    const sort_order = Number.isInteger(body.sort_order) ? body.sort_order : 0;
 
-    if (req.txRun) {
-      const updated = await req.txRun(async client => {
-        const exists = await client.query(`SELECT id FROM categories WHERE id=$1 LIMIT 1`, [id]);
-        if (!exists.rows[0])
-          throw Object.assign(new Error("not_found"), { status: 404 });
-
-        const dup = await client.query(
-          `SELECT id FROM categories WHERE slug=$1 AND id != $2 LIMIT 1`,
-          [slug, id]
-        );
-        if (dup.rows[0])
-          throw Object.assign(new Error("slug_conflict"), { status: 409 });
-
-        const q = `
-          UPDATE categories SET
-            name=$1, slug=$2, description=$3, parent_id=$4, sort_order=$5,
-            trade_type=$6, updated_at=now()
-          WHERE id=$7
-          RETURNING id, slug, name, description, parent_id, trade_type
-        `;
-
-        const r = await client.query(q, [body.name, slug, description, parent_id, sort_order, trade_type || 'both', id]);
-        return r.rows[0];
-      });
-
-      return res.json({ ok: true, category: updated });
+    const trade_type = normalizeTradeType(body.trade_type || 'both');
+    if (!trade_type) {
+      return res.status(400).json({ ok: false, error: 'invalid_trade_type' });
     }
 
-    // fallback
-    const exists = await db.query(`SELECT id FROM categories WHERE id=$1 LIMIT 1`, [id]);
-    if (!exists.rows[0]) return res.status(404).json({ ok: false, error: "not_found" });
+    const image = normalizeImagePath(body.image);
 
-    const dup = await db.query(`SELECT id FROM categories WHERE slug=$1 AND id != $2 LIMIT 1`, [
-      slug,
-      id,
-    ]);
-    if (dup.rows[0]) return res.status(409).json({ ok: false, error: "slug_conflict" });
+    // ensure category exists
+    const exists = await db.query(
+      `SELECT id FROM categories WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+    if (!exists.rows[0]) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
 
-    const q = `
-      UPDATE categories SET
-        name=$1, slug=$2, description=$3, parent_id=$4, sort_order=$5, trade_type=$6, updated_at=now()
-      WHERE id=$7
-      RETURNING id, slug, name, description, parent_id, trade_type
-    `;
-    const r = await db.query(q, [body.name, slug, description, parent_id, sort_order, trade_type || 'both', id]);
+    // slug uniqueness (excluding self)
+    const dup = await db.query(
+      `SELECT id FROM categories WHERE slug=$1 AND id!=$2 LIMIT 1`,
+      [slug, id]
+    );
+    if (dup.rows[0]) {
+      return res.status(409).json({ ok: false, error: 'slug_conflict' });
+    }
 
-    return res.json({ ok: true, category: r.rows[0] });
+    const { rows } = await db.query(
+      `UPDATE categories SET
+        name=$1,
+        slug=$2,
+        description=$3,
+        parent_id=$4,
+        sort_order=$5,
+        trade_type=$6,
+        image=$7
+      WHERE id=$8
+      RETURNING
+        id, slug, name, description, parent_id,
+        sort_order, trade_type, image,
+        created_at, updated_at`,
+      [
+        body.name.trim(),
+        slug,
+        body.description || null,
+        body.parent_id || null,
+        Number.isInteger(body.sort_order) ? body.sort_order : 0,
+        trade_type,
+        image,
+        id
+      ]
+    );
+
+    return res.json({ ok: true, category: rows[0] });
   } catch (err) {
-    console.error("[categories.PUT] error:", err);
+    console.error('[categories.PUT]', err);
 
-    if (err.status === 404)
-      return res.status(404).json({ ok: false, error: "not_found" });
+    if (err.message === 'invalid_image_path') {
+      return res.status(400).json({
+        ok: false,
+        error: 'image_must_be_in_categories_folder'
+      });
+    }
 
-    if (err.status === 409)
-      return res.status(409).json({ ok: false, error: "slug_conflict" });
-
-    return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
+
 
 /* -----------------------------------------------------------------------
    DELETE /api/categories/:id
