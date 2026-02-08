@@ -54,7 +54,7 @@ function requireEditorOrAdmin2(req, res) {
    GET /api/categories
    Supports: ?include_counts=true, ?page, ?limit, ?q, ?trade_type
 ------------------------------------------------------------------------ */
-router.get('/', async (req, res) => {
+router2.get('/', async (req, res) => {
   const db = req.db;
   try {
     if (!db) throw new Error("database pool unavailable");
@@ -153,7 +153,7 @@ router.get('/', async (req, res) => {
 /* -----------------------------------------------------------------------
    GET /api/categories/:id
 ------------------------------------------------------------------------ */
-router.get('/:id', async (req, res) => {
+router2.get('/:id', async (req, res) => {
   const db = req.db;
   try {
     const { rows } = await db.query(
@@ -188,7 +188,7 @@ router.get('/:id', async (req, res) => {
      image?   // "/categories/industrial-machinery.jpg"
    }
 ------------------------------------------------------------------------ */
-router.post('/', async (req, res) => {
+router2.post('/', async (req, res) => {
   if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
@@ -284,7 +284,7 @@ router.post('/', async (req, res) => {
      image?
    }
 ------------------------------------------------------------------------ */
-router.put('/:id', async (req, res) => {
+router2.put('/:id', async (req, res) => {
   if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
