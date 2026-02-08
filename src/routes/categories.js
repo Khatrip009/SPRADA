@@ -4,7 +4,7 @@
 // -----------------------------
 
 const express = require('express');
-const router = express.Router();
+const router2 = express.Router();
 const { v4: uuidv4 } = require('uuid');
 
 const ALLOWED_TRADE_TYPES = new Set(['import', 'export', 'both']);
