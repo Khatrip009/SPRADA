@@ -1,17 +1,24 @@
+// src/lib/buildUrl.js
+
+const SUPABASE_PROJECT =
+  process.env.SUPABASE_PROJECT_REF || 'kwthxsumqqssiywdcevx';
+
+const SUPABASE_BUCKET =
+  process.env.SUPABASE_STORAGE_BUCKET || 'sprada_storage';
+
 const SUPABASE_PUBLIC_BASE =
-  process.env.SUPABASE_PUBLIC_STORAGE_URL ||
-  'https://kwthxsumqqssiywdcevx.supabase.co/storage/v1/object/public';
+  `https://${SUPABASE_PROJECT}.supabase.co/storage/v1/object/public/${SUPABASE_BUCKET}`;
 
 function buildImageUrl(imagePath) {
   if (!imagePath) return null;
 
-  // Already absolute
+  // Already absolute → trust it
   if (/^https?:\/\//i.test(imagePath)) return imagePath;
 
-  // normalize
-  if (imagePath.startsWith('/')) imagePath = imagePath.slice(1);
+  // Normalize path
+  const clean = imagePath.replace(/^\/+/, '');
 
-  return `${SUPABASE_PUBLIC_BASE}/${imagePath}`;
+  return `${SUPABASE_PUBLIC_BASE}/${clean}`;
 }
 
 module.exports = { buildImageUrl };
