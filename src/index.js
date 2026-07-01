@@ -6,6 +6,7 @@
  * - JWT works
  * - Supabase image uploads supported
  * - Product & Blog images routes fixed
+ * - Transaction middleware attached for all routes
  */
 
 const express = require('express');
@@ -16,9 +17,11 @@ const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
 
-
 // ✅ DB POOL
 const { pool } = require('./db');
+
+// ✅ TRANSACTION MIDDLEWARE
+const { attachTransactionMiddleware } = require('./middleware/transaction');
 
 const PORT = parseInt(process.env.PORT || '4200', 10);
 const ENV = process.env.NODE_ENV || 'development';
@@ -34,8 +37,6 @@ app.use(compression());
 app.use(express.json({ limit: '16mb' }));
 app.use(express.urlencoded({ extended: true, limit: '16mb' }));
 
-
-
 /* ---------------- LOGGING ---------------- */
 app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
 
@@ -47,6 +48,11 @@ app.use((req, res, next) => {
   req.app.locals.db = pool;
   next();
 });
+
+/* =========================================================
+   🔥 TRANSACTION MIDDLEWARE (CRITICAL for products POST/PUT/DELETE)
+   ========================================================= */
+app.use(attachTransactionMiddleware);   // <--- ADDED THIS LINE
 
 /* ---------------- CORS ---------------- */
 const allowedOrigins = [
