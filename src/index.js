@@ -7,6 +7,7 @@
  * - Supabase image uploads supported
  * - Product & Blog images routes fixed
  * - Transaction middleware attached for all routes
+ * - Push router mounted
  */
 
 const express = require('express');
@@ -52,7 +53,7 @@ app.use((req, res, next) => {
 /* =========================================================
    🔥 TRANSACTION MIDDLEWARE (CRITICAL for products POST/PUT/DELETE)
    ========================================================= */
-app.use(attachTransactionMiddleware);   // <--- ADDED THIS LINE
+app.use(attachTransactionMiddleware);
 
 /* ---------------- CORS ---------------- */
 const allowedOrigins = [
@@ -126,6 +127,7 @@ mount('events', '/api/events');
 mount('leads', '/api/leads');
 mount('visitors', '/api/visitors');
 mount('metrics', '/api/metrics');
+mount('push', '/api/push');   // <-- ADDED THIS LINE
 
 /* ---------------- 404 ---------------- */
 app.use('/api', (req, res) => {
