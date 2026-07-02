@@ -4,7 +4,7 @@
 // -----------------------------
 
 const express = require('express');
-const router2 = express.Router();
+const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 
 const ALLOWED_TRADE_TYPES = new Set(['import', 'export', 'both']);
@@ -31,21 +31,20 @@ function normalizeTradeType(v) {
 function normalizeImagePath(v) {
   if (!v) return null;
   const s = String(v).trim();
-  // enforce supabase categories folder
   if (!s.startsWith('/categories/')) {
     throw new Error('invalid_image_path');
   }
   return s;
 }
 
-function requireAuth2(req, res) {
+function requireAuth(req, res) {
   if (!req.user) return res.status(401).json({ ok: false, error: "unauthorized" });
   return null;
 }
 
-function requireEditorOrAdmin2(req, res) {
+function requireEditorOrAdmin(req, res) {
   if (!req.user) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const role = Number(req.user.role); // 1 = admin, 2 = editor
+  const role = Number(req.user.role);
   if (role === 1 || role === 2) return null;
   return res.status(403).json({ ok: false, error: "forbidden" });
 }
@@ -54,7 +53,7 @@ function requireEditorOrAdmin2(req, res) {
    GET /api/categories
    Supports: ?include_counts=true, ?page, ?limit, ?q, ?trade_type
 ------------------------------------------------------------------------ */
-router2.get('/', async (req, res) => {
+router.get('/', async (req, res) => {
   const db = req.db;
   try {
     if (!db) throw new Error("database pool unavailable");
@@ -149,11 +148,10 @@ router2.get('/', async (req, res) => {
   }
 });
 
-
 /* -----------------------------------------------------------------------
    GET /api/categories/:id
 ------------------------------------------------------------------------ */
-router2.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res) => {
   const db = req.db;
   try {
     const { rows } = await db.query(
@@ -172,23 +170,10 @@ router2.get('/:id', async (req, res) => {
 
 /* -----------------------------------------------------------------------
    POST /api/categories
-   Body: { name, slug?, description?, parent_id?, sort_order?, trade_type? }
+   Body: { name, slug?, description?, parent_id?, sort_order?, trade_type?, image? }
    Roles: admin/editor only
 ------------------------------------------------------------------------ */
-/* -----------------------------------------------------------------------
-   POST /api/categories
-   Body:
-   {
-     name,
-     slug?,
-     description?,
-     parent_id?,
-     sort_order?,
-     trade_type?,
-     image?   // "/categories/industrial-machinery.jpg"
-   }
------------------------------------------------------------------------- */
-router2.post('/', async (req, res) => {
+router.post('/', async (req, res) => {
   if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
@@ -271,20 +256,7 @@ router2.post('/', async (req, res) => {
    PUT /api/categories/:id
    Roles: admin/editor only
 ------------------------------------------------------------------------ */
-/* -----------------------------------------------------------------------
-   PUT /api/categories/:id
-   Body:
-   {
-     name,
-     slug?,
-     description?,
-     parent_id?,
-     sort_order?,
-     trade_type?,
-     image?
-   }
------------------------------------------------------------------------- */
-router2.put('/:id', async (req, res) => {
+router.put('/:id', async (req, res) => {
   if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
@@ -364,13 +336,12 @@ router2.put('/:id', async (req, res) => {
   }
 });
 
-
 /* -----------------------------------------------------------------------
    DELETE /api/categories/:id
    Roles: admin/editor only
 ------------------------------------------------------------------------ */
-router2.delete('/:id', async (req, res) => {
-  if (requireEditorOrAdmin2(req, res)) return;
+router.delete('/:id', async (req, res) => {
+  if (requireEditorOrAdmin(req, res)) return;
 
   const db = req.db;
   const id = req.params.id;
@@ -403,4 +374,4 @@ router2.delete('/:id', async (req, res) => {
   }
 });
 
-module.exports = router2;
+module.exports = router;
