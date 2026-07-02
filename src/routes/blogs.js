@@ -1,5 +1,5 @@
 // src/routes/blogs.js
-// FULLY JWT-SECURED BLOG ROUTER
+// FULLY JWT-SECURED BLOG ROUTER with COMMENTS & LIKES (sub‑routers mounted before generic catch‑all)
 // Requires: req.db, req.txRun, req.user (from jwtAuthMiddleware)
 
 const express = require('express');
@@ -12,6 +12,10 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
 const { buildImageUrl } = require('../lib/buildUrl');
+
+// ------------------- IMPORT SUB‑ROUTERS -------------------
+const commentRouter = require('./blogComments');
+const likeRouter = require('./blogLikes');
 
 const router = express.Router();
 
@@ -84,6 +88,10 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 function sendOK(res, data = {}) { return res.json({ ok: true, ...data }); }
 function sendError(res, code = 400, message = 'error') { return res.status(code).json({ ok: false, error: message }); }
 
+/* =========================================================
+   ROUTES – ORDERED FROM MOST SPECIFIC TO MOST GENERIC
+   ========================================================= */
+
 /* ----------------------
    LIST / SEARCH
    GET /api/blogs? q, page, limit, published (true/false)
@@ -138,41 +146,11 @@ router.get('/', async (req, res) => {
 });
 
 /* ----------------------
-   GET BY ID or SLUG
-   GET /api/blogs/:idOrSlug
-   ---------------------- */
-router.get('/:idOrSlug', async (req, res) => {
-  const db = req.db;
-  const idOrSlug = req.params.idOrSlug;
-  try {
-    if (!db) throw new Error('database pool unavailable');
-
-    const q = await db.query(
-      `SELECT b.*, b.content as content_json FROM blogs b WHERE b.id::text = $1 OR b.slug = $1 LIMIT 1`, [idOrSlug]
-    );
-    if (!q.rows.length) return sendError(res, 404, 'not_found');
-    const blog = q.rows[0];
-
-    const imgs = (await db.query(`SELECT id, url, caption, created_at FROM blog_images WHERE blog_id = $1 ORDER BY created_at ASC`, [blog.id])).rows;
-    const normalizedImgs = imgs.map(i => ({ ...i, url: buildImageUrl(i.url) }));
-
-    // normalize blog og_image too
-    const normalizedBlog = { ...blog, og_image: buildImageUrl(blog.og_image) };
-
-    return sendOK(res, { blog: { ...normalizedBlog, images: normalizedImgs } });
-  } catch (err) {
-    console.error('[blogs.GET /:idOrSlug] error:', err);
-    return sendError(res, 500, 'server_error');
-  }
-});
-
-/* ----------------------
-   CREATE (admin/editor allowed by your original policy; here admin/editor)
+   CREATE (admin/editor)
    POST /api/blogs
    Body: { title, excerpt, content, author_id?, meta_title?, meta_description?, canonical_url?, og_image? }
    ---------------------- */
 router.post('/', (req, res) => {
-  // Use admin-only if you want stricter control; categories used editor+admin — use requireEditorOrAdmin
   if (requireEditorOrAdmin(req, res)) return;
   (async () => {
     const db = req.db;
@@ -184,7 +162,6 @@ router.post('/', (req, res) => {
 
     const slugBase = slugify(title);
     try {
-      // transaction if available
       if (req.txRun) {
         const inserted = await req.txRun(async client => {
           let slug = slugBase;
@@ -201,11 +178,9 @@ router.post('/', (req, res) => {
             RETURNING id, title, slug, excerpt, author_id, is_published, created_at, og_image
           `;
           const id = uuidv4();
-          // store og_image as provided (frontend may submit relative /uploads path); normalize on response
           const r = await client.query(insertSql, [id, title, slug, excerpt || null, JSON.stringify(content), authorToUse, meta_title || null, meta_description || null, canonical_url || null, og_image || null]);
           return r.rows[0];
         });
-        // Normalize returned og_image
         const insertedNormalized = { ...inserted, og_image: buildImageUrl(inserted.og_image) };
         return res.status(201).json({ ok: true, blog: insertedNormalized });
       }
@@ -282,7 +257,6 @@ router.put('/:id', (req, res) => {
           const updated = await client.query(updateSql, params);
           return updated.rows[0];
         });
-        // Normalize og_image in response
         const updatedNormalized = { ...updated, og_image: buildImageUrl(updated.og_image) };
         return sendOK(res, { blog: updatedNormalized });
       }
@@ -383,13 +357,11 @@ router.post('/:id/publish', (req, res) => {
    POST /api/blogs/upload (multipart form-data, field 'file')
    ---------------------- */
 router.post('/upload', upload.single('file'), (req, res) => {
-  // Only editor/admin allowed to upload images
   if (requireEditorOrAdmin(req, res)) return;
   (async () => {
     try {
       if (!req.file) return sendError(res, 400, 'no_file');
       const relPath = `/uploads/blogs/${path.basename(req.file.path)}`;
-      // return canonical full URL
       const url = buildImageUrl(relPath);
       return res.status(201).json({ ok: true, url });
     } catch (err) {
@@ -397,6 +369,41 @@ router.post('/upload', upload.single('file'), (req, res) => {
       return sendError(res, 500, 'server_error');
     }
   })();
+});
+
+/* =========================================================
+   🔥 MOUNT COMMENT & LIKE SUB‑ROUTERS (they contain
+   the specific routes like /:id/comments, /:id/like etc.)
+   ========================================================= */
+router.use('/', commentRouter);
+router.use('/', likeRouter);
+
+/* =========================================================
+   ⚠️ GENERIC GET BY ID OR SLUG – MUST BE THE LAST ROUTE
+   ========================================================= */
+router.get('/:idOrSlug', async (req, res) => {
+  const db = req.db;
+  const idOrSlug = req.params.idOrSlug;
+  try {
+    if (!db) throw new Error('database pool unavailable');
+
+    const q = await db.query(
+      `SELECT b.*, b.content as content_json FROM blogs b WHERE b.id::text = $1 OR b.slug = $1 LIMIT 1`, [idOrSlug]
+    );
+    if (!q.rows.length) return sendError(res, 404, 'not_found');
+    const blog = q.rows[0];
+
+    const imgs = (await db.query(`SELECT id, url, caption, created_at FROM blog_images WHERE blog_id = $1 ORDER BY created_at ASC`, [blog.id])).rows;
+    const normalizedImgs = imgs.map(i => ({ ...i, url: buildImageUrl(i.url) }));
+
+    // normalize blog og_image too
+    const normalizedBlog = { ...blog, og_image: buildImageUrl(blog.og_image) };
+
+    return sendOK(res, { blog: { ...normalizedBlog, images: normalizedImgs } });
+  } catch (err) {
+    console.error('[blogs.GET /:idOrSlug] error:', err);
+    return sendError(res, 500, 'server_error');
+  }
 });
 
 module.exports = router;
