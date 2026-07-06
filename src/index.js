@@ -8,6 +8,7 @@
  * - Product & Blog images routes fixed
  * - Transaction middleware attached for all routes
  * - Push router mounted
+ * - Uploads router mounted (generic /api/uploads/:space)
  */
 
 const express = require('express');
@@ -17,6 +18,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
+const fileUpload = require('express-fileupload'); // 👈 ADDED
 
 // ✅ DB POOL
 const { pool } = require('./db');
@@ -37,6 +39,15 @@ app.use(compression());
 /* ---------------- BODY PARSERS ---------------- */
 app.use(express.json({ limit: '16mb' }));
 app.use(express.urlencoded({ extended: true, limit: '16mb' }));
+
+/* ---------------- FILE UPLOAD (for /api/uploads) ---------------- */
+app.use(fileUpload({
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max
+  abortOnLimit: true,
+  useTempFiles: false,
+  safeFileNames: true,
+  preserveExtension: true
+}));
 
 /* ---------------- LOGGING ---------------- */
 app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
@@ -127,7 +138,8 @@ mount('events', '/api/events');
 mount('leads', '/api/leads');
 mount('visitors', '/api/visitors');
 mount('metrics', '/api/metrics');
-mount('push', '/api/push');   // <-- ADDED THIS LINE
+mount('push', '/api/push');
+mount('uploads', '/api/uploads');   // 👈 ADDED
 
 /* ---------------- 404 ---------------- */
 app.use('/api', (req, res) => {
