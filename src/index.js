@@ -140,6 +140,7 @@ mount('visitors', '/api/visitors');
 mount('metrics', '/api/metrics');
 mount('push', '/api/push');
 mount('uploads', '/api/uploads');   // 👈 ADDED
+mount('leadsStats', '/api/leads-stats');
 
 /* ---------------- 404 ---------------- */
 app.use('/api', (req, res) => {
