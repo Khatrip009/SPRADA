@@ -6,6 +6,9 @@
  *
  * Also exposes a simple image proxy GET /api/uploads/proxy?src=...
  * to work around remote-host 403s (whitelisted hosts only).
+ *
+ * Additionally provides a generic POST /api/uploads/:space endpoint
+ * that uses Supabase Storage (service role) to upload files.
  */
 
 const express = require('express');
@@ -23,6 +26,9 @@ const {
 } = require('@aws-sdk/client-s3');
 
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+// 👇 Add this import for Supabase
+const { createClient } = require('@supabase/supabase-js');
 
 /* ===================== S3 CONFIG ===================== */
 
@@ -192,6 +198,7 @@ router.get('/proxy', async (req, res) => {
     return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
+
 /* ================================================================
    GENERIC UPLOAD (space‑aware)
    POST /api/uploads/:space
@@ -201,7 +208,7 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'sprada_storage';
+const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'sprada_storage';
 
 function requireAuth(req, res) {
   if (!req.user) {
@@ -213,7 +220,7 @@ function requireAuth(req, res) {
 
 function publicUrl(path) {
   if (!path) return null;
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
+  const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
   return data?.publicUrl || null;
 }
 
@@ -234,7 +241,7 @@ router.post('/:space', async (req, res) => {
   try {
     // Upload to Supabase using service role key (bypasses RLS)
     const { error: uploadError } = await supabase.storage
-      .from(BUCKET)
+      .from(STORAGE_BUCKET)
       .upload(storagePath, file.data, {
         contentType: file.mimetype,
         upsert: false
@@ -258,4 +265,5 @@ router.post('/:space', async (req, res) => {
     });
   }
 });
+
 module.exports = router;
