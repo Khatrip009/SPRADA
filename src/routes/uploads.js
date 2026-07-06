@@ -192,5 +192,70 @@ router.get('/proxy', async (req, res) => {
     return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
+/* ================================================================
+   GENERIC UPLOAD (space‑aware)
+   POST /api/uploads/:space
+   ================================================================ */
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'sprada_storage';
+
+function requireAuth(req, res) {
+  if (!req.user) {
+    res.status(401).json({ ok: false, error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+function publicUrl(path) {
+  if (!path) return null;
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+
+router.post('/:space', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const { space } = req.params; // 'products' or 'blogs'
+
+  if (!req.files || !req.files.file) {
+    return res.status(400).json({ ok: false, error: 'file_required' });
+  }
+
+  const file = req.files.file;
+  const ext = file.name.split('.').pop();
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+  const storagePath = `${space}/${filename}`;
+
+  try {
+    // Upload to Supabase using service role key (bypasses RLS)
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET)
+      .upload(storagePath, file.data, {
+        contentType: file.mimetype,
+        upsert: false
+      });
+
+    if (uploadError) throw uploadError;
+
+    const url = publicUrl(storagePath);
+
+    return res.status(201).json({
+      ok: true,
+      publicUrl: url,
+      filename: file.name,
+      path: storagePath
+    });
+  } catch (err) {
+    console.error('[uploads.POST] error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'upload_failed'
+    });
+  }
+});
 module.exports = router;
