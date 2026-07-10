@@ -24,29 +24,21 @@ function badRequest(res, msg) {
 
 function normalizeStoragePath(path) {
   if (!path) return null;
-
-  // If FULL URL was mistakenly stored, extract relative path
   if (path.startsWith("http")) {
     const marker = `/storage/v1/object/public/${BUCKET}/`;
     const idx = path.indexOf(marker);
     if (idx !== -1) {
       return path.slice(idx + marker.length);
     }
-    return null; // invalid legacy URL
+    return null;
   }
-
-  // Ensure no leading slash
   return path.replace(/^\/+/, "");
 }
 
 function publicUrl(path) {
   const cleanPath = normalizeStoragePath(path);
   if (!cleanPath) return null;
-
-  const { data } = supabase.storage
-    .from(BUCKET)
-    .getPublicUrl(cleanPath);
-
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(cleanPath);
   return data?.publicUrl || null;
 }
 
@@ -60,7 +52,6 @@ function requireAuth(req, res) {
 
 /* =====================================================
    GET PRODUCT IMAGES
-   GET /api/product-images?product_id=UUID
 ===================================================== */
 router.get('/', async (req, res) => {
   const db = req.app.locals.db;
@@ -109,17 +100,12 @@ router.get('/', async (req, res) => {
     });
   } catch (err) {
     console.error('[product-images.GET]', err);
-    return res.status(500).json({
-      ok: false,
-      error: 'server_error'
-    });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
 /* =====================================================
    UPLOAD PRODUCT IMAGE
-   POST /api/product-images
-   multipart/form-data
 ===================================================== */
 router.post('/', async (req, res) => {
   if (!requireAuth(req, res)) return;
@@ -141,7 +127,6 @@ router.post('/', async (req, res) => {
   const storagePath = `products/${filename}`;
 
   try {
-    /* Upload to Supabase Storage */
     const { error: uploadError } = await supabase.storage
       .from(BUCKET)
       .upload(storagePath, file.data, {
@@ -151,7 +136,6 @@ router.post('/', async (req, res) => {
 
     if (uploadError) throw uploadError;
 
-    /* Ensure single primary image */
     if (is_primary === 'true') {
       await db.query(
         'UPDATE product_images SET is_primary=false WHERE product_id=$1',
@@ -193,16 +177,12 @@ router.post('/', async (req, res) => {
     });
   } catch (err) {
     console.error('[product-images.POST]', err);
-    return res.status(500).json({
-      ok: false,
-      error: 'upload_failed'
-    });
+    return res.status(500).json({ ok: false, error: 'upload_failed' });
   }
 });
 
 /* =====================================================
    DELETE PRODUCT IMAGE
-   DELETE /api/product-images/:id
 ===================================================== */
 router.delete('/:id', async (req, res) => {
   if (!requireAuth(req, res)) return;
@@ -226,19 +206,77 @@ router.delete('/:id', async (req, res) => {
 
     const path = rows[0].url;
 
-    /* Delete from storage */
     await supabase.storage.from(BUCKET).remove([path]);
 
-    /* Delete from DB */
     await db.query('DELETE FROM product_images WHERE id=$1', [id]);
 
     return res.json({ ok: true });
   } catch (err) {
     console.error('[product-images.DELETE]', err);
-    return res.status(500).json({
-      ok: false,
-      error: 'delete_failed'
+    return res.status(500).json({ ok: false, error: 'delete_failed' });
+  }
+});
+
+/* =====================================================
+   PATCH PRODUCT IMAGE (set is_primary)
+===================================================== */
+router.patch('/:id', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const db = req.app.locals.db;
+  const { id } = req.params;
+  const { is_primary } = req.body;
+
+  if (!isUuid(id)) {
+    return badRequest(res, 'invalid_id');
+  }
+
+  if (is_primary === undefined) {
+    return badRequest(res, 'is_primary_required');
+  }
+
+  try {
+    const { rows: existing } = await db.query(
+      'SELECT product_id FROM product_images WHERE id=$1',
+      [id]
+    );
+    if (!existing.length) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    const productId = existing[0].product_id;
+
+    if (is_primary === true) {
+      await db.query(
+        'UPDATE product_images SET is_primary=false WHERE product_id=$1 AND id != $2',
+        [productId, id]
+      );
+    }
+
+    const { rows } = await db.query(
+      `UPDATE product_images
+       SET is_primary=$1, updated_at=NOW()
+       WHERE id=$2
+       RETURNING id, product_id, url, filename, is_primary, filesize, created_at`,
+      [is_primary, id]
+    );
+
+    const image = rows[0];
+    return res.json({
+      ok: true,
+      image: {
+        id: image.id,
+        product_id: image.product_id,
+        is_primary: image.is_primary,
+        url: publicUrl(image.url),
+        filename: image.filename,
+        filesize: image.filesize,
+        created_at: image.created_at
+      }
     });
+  } catch (err) {
+    console.error('[product-images.PATCH]', err);
+    return res.status(500).json({ ok: false, error: 'update_failed' });
   }
 });
 
