@@ -31,10 +31,14 @@ function normalizeTradeType(v) {
 function normalizeImagePath(v) {
   if (!v) return null;
   const s = String(v).trim();
-  if (!s.startsWith('/categories/')) {
-    throw new Error('invalid_image_path');
+  if (s.startsWith('/categories/')) {
+    return s;
   }
-  return s;
+  if (s.startsWith('categories/')) {
+    return '/' + s; // prepend slash to match expected format
+  }
+  // Optionally allow full Supabase URLs? For now we enforce categories folder.
+  throw new Error('invalid_image_path');
 }
 
 function requireAuth(req, res) {
